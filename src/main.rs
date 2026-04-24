@@ -139,7 +139,7 @@ async fn list_models(State(state): State<AppState>) -> Json<Value> {
             let cfg_clone = cfg.clone();
             tokio::task::spawn_blocking(move || {
                 let resolved = cfg_clone.resolve_agent(&name);
-                query_models(&resolved, &name, 15)
+                query_models(&resolved, &name, 200)
             })
         })
         .collect();
@@ -190,8 +190,8 @@ async fn create_session(
         run_prompt(
             &resolved,
             &agent_type_clone,
-            None,     // 新建 acp session
-            &[],      // 空 messages，仅为获取 session_id + config_options
+            None, // 新建 acp session
+            &[],  // 空 messages，仅为获取 session_id + config_options
             None,
             None,
             model_id_clone.as_deref(),
@@ -441,7 +441,11 @@ async fn chat_completions(
             on_chunk,
             None,
             model_id_clone.as_deref(),
-            if config_opts.is_empty() { None } else { Some(config_opts) },
+            if config_opts.is_empty() {
+                None
+            } else {
+                Some(config_opts)
+            },
         );
 
         if let Some(sid) = existing_sess {
@@ -505,7 +509,10 @@ async fn chat_completions(
     };
 
     let mut headers = HeaderMap::new();
-    headers.insert("content-type", "text/event-stream; charset=utf-8".parse().unwrap());
+    headers.insert(
+        "content-type",
+        "text/event-stream; charset=utf-8".parse().unwrap(),
+    );
     headers.insert("cache-control", "no-cache".parse().unwrap());
     headers.insert("connection", "keep-alive".parse().unwrap());
     if let Some(sid) = sess_id_for_header {
@@ -583,7 +590,11 @@ async fn completions(
             None,
             None,
             model_id.as_deref(),
-            if config_opts.is_empty() { None } else { Some(config_opts) },
+            if config_opts.is_empty() {
+                None
+            } else {
+                Some(config_opts)
+            },
         );
         if let Some(sid) = existing_sess {
             if let Ok(ref r) = run {
@@ -632,16 +643,17 @@ async fn completions(
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "hab=info,warn".to_string()),
-        )
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "hab=info,warn".to_string()))
         .init();
 
     let config = Arc::new(Config::load());
     let sessions = new_store();
 
-    let state = AppState { config: config.clone(), sessions, models_cache: Arc::new(Mutex::new(None)) };
+    let state = AppState {
+        config: config.clone(),
+        sessions,
+        models_cache: Arc::new(Mutex::new(None)),
+    };
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -671,7 +683,12 @@ async fn main() {
     let host = std::env::var("HAB_HOST")
         .or_else(|_| std::env::var("ACP_SERVE_HOST"))
         .or_else(|_| std::env::var("ACP_BRIDGE_HOST"))
-        .unwrap_or_else(|_| config.host.clone().unwrap_or_else(|| "127.0.0.1".to_string()));
+        .unwrap_or_else(|_| {
+            config
+                .host
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1".to_string())
+        });
 
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
