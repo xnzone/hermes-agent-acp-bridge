@@ -1,6 +1,6 @@
 # hermes-agent-acp-bridge
 
-A Rust acp-bridge of [hermes-agent]([../acp-bridge](https://github.com/NousResearch/hermes-agent)), providing an OpenAI-compatible HTTP API
+A Rust acp-bridge of [hermes-agent](https://github.com/NousResearch/hermes-agent), providing an OpenAI-compatible HTTP API
 that talks to ACP (Agent Client Protocol) agents like CodeBuddy and Copilot via stdio.
 
 ## Features vs TypeScript version
