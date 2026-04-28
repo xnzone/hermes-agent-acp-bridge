@@ -4,7 +4,7 @@ mod config;
 mod session;
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use axum::{
@@ -589,71 +589,48 @@ async fn chat_completions_stream(
         let mut total_chars = 0usize;
         let mut had_thinking = false;
         let mut thinking_ended = false;
-        // 在收到第一条真实内容前，定期发送空 content chunk 保活
-        let mut received_first_content = false;
-
-        // keepalive：每 5 秒发一个空 content chunk，防止超时断开（仅在等待第一条内容时）
-        let mut keepalive = tokio::time::interval(Duration::from_secs(5));
-        keepalive.tick().await; // 消耗掉首次立即触发的 tick
 
         loop {
-            tokio::select! {
-                // keepalive 心跳：仅在还没收到第一条内容时发送
-                _ = keepalive.tick(), if !received_first_content => {
-                    let keepalive_chunk = json!({
+            match chunk_rx.recv().await {
+                Some(StreamEvent::ThoughtChunk(chunk)) => {
+                    if !had_thinking {
+                        had_thinking = true;
+                    }
+                    let payload = json!({
                         "id": cmpl_id_clone,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": display_model_clone,
-                        "choices": [{ "index": 0, "delta": { "content": "" }, "finish_reason": null }],
+                        "choices": [{ "index": 0, "delta": { "reasoning_content": chunk }, "finish_reason": null }],
                     });
-                    yield Ok(format!("data: {}\n\n", keepalive_chunk));
+                    yield Ok(format!("data: {}\n\n", payload));
                 }
-                event = chunk_rx.recv() => {
-                    match event {
-                        Some(StreamEvent::ThoughtChunk(chunk)) => {
-                            received_first_content = true;
-                            if !had_thinking {
-                                had_thinking = true;
-                            }
-                            let payload = json!({
-                                "id": cmpl_id_clone,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": display_model_clone,
-                                "choices": [{ "index": 0, "delta": { "reasoning_content": chunk }, "finish_reason": null }],
-                            });
-                            yield Ok(format!("data: {}\n\n", payload));
-                        }
-                        Some(StreamEvent::TextChunk(chunk)) => {
-                            received_first_content = true;
-                            // 如果还有未结束的 thinking，先结束它
-                            if had_thinking && !thinking_ended {
-                                thinking_ended = true;
-                                let thought_end = json!({
-                                    "id": cmpl_id_clone,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": display_model_clone,
-                                    "choices": [{ "index": 0, "delta": { "reasoning_content": "" }, "finish_reason": null }],
-                                });
-                                yield Ok(format!("data: {}\n\n", thought_end));
-                            }
-                            total_chars += chunk.len();
-                            let payload = json!({
-                                "id": cmpl_id_clone,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": display_model_clone,
-                                "choices": [{ "index": 0, "delta": { "content": chunk }, "finish_reason": null }],
-                            });
-                            yield Ok(format!("data: {}\n\n", payload));
-                        }
-                        None => {
-                            // channel 关闭 = agent 完成了输出
-                            break;
-                        }
+                Some(StreamEvent::TextChunk(chunk)) => {
+                    // 如果还有未结束的 thinking，先结束它
+                    if had_thinking && !thinking_ended {
+                        thinking_ended = true;
+                        let thought_end = json!({
+                            "id": cmpl_id_clone,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": display_model_clone,
+                            "choices": [{ "index": 0, "delta": { "reasoning_content": "" }, "finish_reason": null }],
+                        });
+                        yield Ok(format!("data: {}\n\n", thought_end));
                     }
+                    total_chars += chunk.len();
+                    let payload = json!({
+                        "id": cmpl_id_clone,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": display_model_clone,
+                        "choices": [{ "index": 0, "delta": { "content": chunk }, "finish_reason": null }],
+                    });
+                    yield Ok(format!("data: {}\n\n", payload));
+                }
+                None => {
+                    // channel 关闭 = agent 完成了输出
+                    break;
                 }
             }
         }
