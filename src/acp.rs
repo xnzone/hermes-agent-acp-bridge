@@ -290,6 +290,65 @@ pub fn run_prompt(
                 switch_model(&conn, &sess_id, model, &config_opts, &agent_type).await;
             }
 
+            // 并发：prompt 执行期间同时 drain stream events
+            // 这样 on_chunk 回调能在 prompt() await 期间实时触发，
+            // 而不是等 prompt() 完成后再批量处理
+            let (prompt_done_tx, mut prompt_done_rx) =
+                tokio::sync::oneshot::channel::<()>();
+
+            // 后台任务：持续从 rx 读取 stream events 并调用回调
+            let on_chunk_clone = on_chunk.clone();
+            let on_thought_chunk_clone = on_thought_chunk.clone();
+            let drain_handle = tokio::task::spawn_local(async move {
+                let mut collected_text = String::new();
+                let mut collected_thought = String::new();
+
+                loop {
+                    tokio::select! {
+                        event = rx.recv() => {
+                            match event {
+                                Some(StreamEvent::TextChunk(chunk)) => {
+                                    if let Some(cb) = &on_chunk_clone {
+                                        cb(chunk.clone());
+                                    }
+                                    collected_text.push_str(&chunk);
+                                }
+                                Some(StreamEvent::ThoughtChunk(chunk)) => {
+                                    if let Some(cb) = &on_thought_chunk_clone {
+                                        cb(chunk.clone());
+                                    }
+                                    collected_thought.push_str(&chunk);
+                                }
+                                None => break,
+                            }
+                        }
+                        _ = &mut prompt_done_rx => {
+                            // prompt 完成了，但继续 drain 剩余 events
+                            // 直到 channel 关闭（conn drop 后 tx 被 drop）
+                            while let Some(event) = rx.recv().await {
+                                match event {
+                                    StreamEvent::TextChunk(chunk) => {
+                                        if let Some(cb) = &on_chunk_clone {
+                                            cb(chunk.clone());
+                                        }
+                                        collected_text.push_str(&chunk);
+                                    }
+                                    StreamEvent::ThoughtChunk(chunk) => {
+                                        if let Some(cb) = &on_thought_chunk_clone {
+                                            cb(chunk.clone());
+                                        }
+                                        collected_thought.push_str(&chunk);
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                (collected_text, collected_thought)
+            });
+
             // prompt
             let prompt_req = PromptRequest::new(
                 SessionId::from(sess_id.clone()),
@@ -297,31 +356,13 @@ pub fn run_prompt(
             );
             let _resp = conn.prompt(prompt_req).await.context("prompt failed")?;
 
-            // drain
-            for _ in 0..20 {
-                tokio::task::yield_now().await;
-            }
+            // 通知 drain 任务 prompt 已完成
+            let _ = prompt_done_tx.send(());
+            // drop conn 让 tx 被 drop，从而 rx.recv() 返回 None
             drop(conn);
-            rx.close();
 
-            let mut collected_text = String::new();
-            let mut collected_thought = String::new();
-            while let Some(event) = rx.recv().await {
-                match event {
-                    StreamEvent::TextChunk(chunk) => {
-                        if let Some(cb) = &on_chunk {
-                            cb(chunk.clone());
-                        }
-                        collected_text.push_str(&chunk);
-                    }
-                    StreamEvent::ThoughtChunk(chunk) => {
-                        if let Some(cb) = &on_thought_chunk {
-                            cb(chunk.clone());
-                        }
-                        collected_thought.push_str(&chunk);
-                    }
-                }
-            }
+            // 等待 drain 完成
+            let (collected_text, collected_thought) = drain_handle.await?;
 
             let _ = child.kill().await;
 
