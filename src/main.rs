@@ -586,9 +586,20 @@ async fn chat_completions_stream(
         });
         yield Ok::<String, std::convert::Infallible>(format!("data: {}\n\n", role_chunk));
 
+        // 立刻发一个"思考中"的 reasoning_content delta，让客户端显示思考状态
+        let thinking_indicator = json!({
+            "id": cmpl_id_clone,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": display_model_clone,
+            "choices": [{ "index": 0, "delta": { "reasoning_content": "思考中..." }, "finish_reason": null }],
+        });
+        yield Ok(format!("data: {}\n\n", thinking_indicator));
+
         let mut total_chars = 0usize;
         let mut had_thinking = false;
         let mut thinking_ended = false;
+        let mut first_real_content = true; // 是否是第一个真实内容
 
         // keepalive：每 15 秒发一个 SSE comment，防止中间件超时断开
         let mut keepalive = tokio::time::interval(Duration::from_secs(15));
@@ -603,6 +614,20 @@ async fn chat_completions_stream(
                 event = chunk_rx.recv() => {
                     match event {
                         Some(StreamEvent::ThoughtChunk(chunk)) => {
+                            // 第一个真实内容到来，关闭"思考中"占位符
+                            if first_real_content {
+                                first_real_content = false;
+                                // 如果 agent 自己发了 ThoughtChunk，替换掉占位的"思考中..."
+                                // 发一个空 reasoning_content 关闭占位符，再由后续 ThoughtChunk 接管
+                                let clear_indicator = json!({
+                                    "id": cmpl_id_clone,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": display_model_clone,
+                                    "choices": [{ "index": 0, "delta": { "reasoning_content": "" }, "finish_reason": null }],
+                                });
+                                yield Ok(format!("data: {}\n\n", clear_indicator));
+                            }
                             if !had_thinking {
                                 had_thinking = true;
                             }
@@ -616,6 +641,21 @@ async fn chat_completions_stream(
                             yield Ok(format!("data: {}\n\n", payload));
                         }
                         Some(StreamEvent::TextChunk(chunk)) => {
+                            // 第一个真实内容到来，关闭"思考中"占位符
+                            if first_real_content {
+                                first_real_content = false;
+                                // TextChunk 到了，结束 thinking 区域
+                                let clear_indicator = json!({
+                                    "id": cmpl_id_clone,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": display_model_clone,
+                                    "choices": [{ "index": 0, "delta": { "reasoning_content": "" }, "finish_reason": null }],
+                                });
+                                yield Ok(format!("data: {}\n\n", clear_indicator));
+                                thinking_ended = true;
+                                had_thinking = true; // 标记有过 thinking（占位符算一次）
+                            }
                             // 如果还有未结束的 thinking，先结束它
                             if had_thinking && !thinking_ended {
                                 thinking_ended = true;
