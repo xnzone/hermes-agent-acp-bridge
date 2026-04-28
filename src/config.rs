@@ -7,6 +7,14 @@ pub struct AgentConfig {
     pub args: Option<Vec<String>>,
     pub env: Option<HashMap<String, String>>,
     pub startup_delay_secs: Option<u64>,
+    pub models: Option<Vec<ModelEntry>>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct ModelEntry {
+    pub name: String,
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -83,7 +91,11 @@ impl Config {
             .and_then(|a| a.startup_delay_secs)
             .unwrap_or(0);
 
-        ResolvedAgent { command, args, env, startup_delay_secs: startup_delay }
+        let static_models = agent_cfg
+            .and_then(|a| a.models.clone())
+            .unwrap_or_default();
+
+        ResolvedAgent { command, args, env, startup_delay_secs: startup_delay, static_models }
     }
 }
 
@@ -92,6 +104,7 @@ pub struct ResolvedAgent {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub startup_delay_secs: u64,
+    pub static_models: Vec<ModelEntry>,
 }
 
 fn expand_home(s: String) -> String {
