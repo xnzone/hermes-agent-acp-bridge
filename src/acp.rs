@@ -21,8 +21,9 @@ use crate::config::ResolvedAgent;
 
 pub type PermissionCallback = Arc<dyn Fn(serde_json::Value) -> bool + Send + Sync>;
 
-// ─── 内部 Channel 消息 ────────────────────────────────────────────────────────
+// ─── 内部 Channel 消息（旧版 run_prompt 使用，新版本在 agent_pool.rs）──────
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum StreamEvent {
     TextChunk(String),
@@ -194,6 +195,7 @@ fn merge_spans(spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
 
 // ─── 公开接口 ─────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub fn run_prompt(
     resolved: &ResolvedAgent,
     agent_type: &str,
@@ -526,6 +528,7 @@ pub fn query_models(
 
 // ─── 辅助 ─────────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 async fn switch_model(
     conn: &ClientSideConnection,
     sess_id: &str,
@@ -564,7 +567,7 @@ async fn switch_model(
 }
 
 /// 构建 prompt 文本，包含工具定义和指令（参考 copilot_acp_client.py 的 _format_messages_as_prompt）
-fn build_prompt(
+pub fn build_prompt(
     messages: &[ChatMessage],
     tools: Option<&[serde_json::Value]>,
     tool_choice: Option<&serde_json::Value>,
@@ -792,6 +795,7 @@ pub struct ExtractedFunction {
     pub arguments: String,
 }
 
+#[allow(dead_code)]
 pub struct RunResult {
     pub text: String,
     pub reasoning: Option<String>,

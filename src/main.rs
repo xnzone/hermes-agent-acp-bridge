@@ -1,4 +1,5 @@
 mod acp;
+mod agent_pool;
 mod config;
 mod session;
 
@@ -20,7 +21,8 @@ use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::{
-    acp::{estimate_tokens, query_models, run_prompt, ChatMessage, ExtractedToolCall},
+    acp::{estimate_tokens, query_models, ChatMessage, ExtractedToolCall},
+    agent_pool::{AgentPool, StreamEvent},
     config::Config,
     session::{new_store, Session, SessionStore},
 };
@@ -30,6 +32,7 @@ use crate::{
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
+    pool: Arc<AgentPool>,
     sessions: SessionStore,
     // (timestamp_secs, cached_models) — TTL 60s
     models_cache: Arc<Mutex<Option<(u64, Vec<Value>)>>>,
@@ -226,35 +229,28 @@ async fn create_session(
     tracing::info!("[create_session] request body: {}", serde_json::to_string(&body).unwrap_or_else(|e| format!("<serialize error: {e}>")));
 
     let (agent_type, model_id) = parse_model(&body.model);
-    let cfg = state.config.clone();
     let sessions = state.sessions.clone();
 
-    let agent_type_clone = agent_type.clone();
-    let model_id_clone = model_id.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        let resolved = cfg.resolve_agent(&agent_type_clone);
-        run_prompt(
-            &resolved,
-            &agent_type_clone,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            model_id_clone.as_deref(),
-            None,
-            None,
-            None,
-        )
-    })
-    .await;
+    // 通过 AgentPool 触发 agent 启动和 session 创建
+    let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+    let result = state
+        .pool
+        .prompt(&agent_type, model_id.as_deref(), String::new(), chunk_tx)
+        .await;
 
     match result {
-        Ok(Ok(run)) => {
+        Ok(pr) => {
+            // 获取 config_options
+            let config_opts = state
+                .pool
+                .get_session_info(&agent_type, model_id.as_deref())
+                .await
+                .map(|(_, opts)| opts)
+                .unwrap_or_default();
+
             let mut sess = Session::new(&agent_type, model_id);
-            sess.acp_session_id = run.session_id;
-            sess.config_options = run.config_options;
+            sess.acp_session_id = pr.session_id.clone();
+            sess.config_options = config_opts;
             let sess_id = sess.id.clone();
             let created_at = sess.created_at;
             let display_model = sess.display_model();
@@ -269,31 +265,15 @@ async fn create_session(
             });
             tracing::info!("[create_session] response body: {resp}");
 
-            (
-                StatusCode::CREATED,
-                Json(resp),
-            )
-                .into_response()
-        }
-        Ok(Err(e)) => {
-            let resp = json!({ "error": { "message": e.to_string(), "type": "server_error" } });
-            tracing::error!("[create_session] response error: {resp}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(resp),
-            )
-                .into_response()
+            (StatusCode::CREATED, Json(resp)).into_response()
         }
         Err(e) => {
-            let resp = json!({ "error": { "message": e.to_string(), "type": "server_error" } });
+            let msg = e.to_string();
+            let resp = json!({ "error": { "message": msg, "type": "server_error" } });
             tracing::error!("[create_session] response error: {resp}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(resp),
-            )
-                .into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(resp)).into_response()
         }
-    }
+    };
 }
 
 // GET /v1/sessions
@@ -430,127 +410,109 @@ async fn chat_completions(
         }
     };
 
-    let (agent_type, model_id, existing_sess, config_opts, acp_sid) =
-        if let Some(sid) = &body.session_id {
-            match state.sessions.get(sid.as_str()) {
-                None => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(json!({ "error": { "message": format!("session {sid} not found") } })),
-                    )
-                        .into_response();
-                }
-                Some(sess) => (
-                    sess.agent_type.clone(),
-                    sess.model_id.clone(),
-                    Some(sid.clone()),
-                    sess.config_options.clone(),
-                    Some(sess.acp_session_id.clone()),
-                ),
+    let (agent_type, model_id) = if let Some(sid) = &body.session_id {
+        match state.sessions.get(sid.as_str()) {
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": { "message": format!("session {sid} not found") }
+                    })),
+                )
+                    .into_response();
             }
-        } else {
-            let raw_model = match &body.model {
-                Some(m) if !m.trim().is_empty() => m.trim().to_string(),
-                _ => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": { "message": "model or session_id required" } })),
-                    )
-                        .into_response();
-                }
-            };
-            let (agent, model) = parse_model(&raw_model);
-            (agent, model, None, vec![], None)
+            Some(sess) => (sess.agent_type.clone(), sess.model_id.clone()),
+        }
+    } else {
+        let raw_model = match &body.model {
+            Some(m) if !m.trim().is_empty() => m.trim().to_string(),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": { "message": "model or session_id required" } })),
+                )
+                    .into_response();
+            }
         };
+        let (agent, model) = parse_model(&raw_model);
+        (agent, model)
+    };
+
+    // 构建 prompt 文本（复用 acp.rs 中的 build_prompt 逻辑）
+    let prompt_text = crate::acp::build_prompt(&messages, body.tools.as_deref(), body.tool_choice.as_ref());
 
     if is_stream {
-        chat_completions_stream(state, body, messages, agent_type, model_id, existing_sess, config_opts, acp_sid).await
+        chat_completions_stream(state, prompt_text, agent_type, model_id).await
     } else {
-        chat_completions_json(state, body, messages, agent_type, model_id, existing_sess, config_opts, acp_sid).await
+        chat_completions_json(state, prompt_text, agent_type, model_id).await
     }
 }
 
 // ── 非流式 JSON 响应 ──────────────────────────────────────────────────────────
 async fn chat_completions_json(
     state: AppState,
-    body: ChatCompletionRequest,
-    messages: Vec<ChatMessage>,
+    prompt_text: String,
     agent_type: String,
     model_id: Option<String>,
-    existing_sess: Option<String>,
-    config_opts: Vec<serde_json::Value>,
-    acp_sid: Option<String>,
 ) -> axum::response::Response {
-    let cfg = state.config.clone();
-    let sessions = state.sessions.clone();
     let display_model = match &model_id {
         Some(m) => format!("acp/{agent_type}/{m}"),
         None => format!("acp/{agent_type}"),
     };
 
-    let tools_clone = body.tools.clone();
-    let tool_choice_clone = body.tool_choice.clone();
+    let prompt_tokens = estimate_tokens(&prompt_text);
 
-    let result = tokio::task::spawn_blocking(move || {
-        let resolved = cfg.resolve_agent(&agent_type);
-        let run = run_prompt(
-            &resolved,
-            &agent_type,
-            acp_sid,
-            &messages,
-            None,
-            None,
-            None,
-            model_id.as_deref(),
-            if config_opts.is_empty() {
-                None
-            } else {
-                Some(config_opts)
-            },
-            tools_clone.as_deref(),
-            tool_choice_clone.as_ref(),
-        );
-        if let Some(sid) = existing_sess {
-            if let Ok(ref r) = run {
-                if let Some(mut sess) = sessions.get_mut(&sid) {
-                    sess.acp_session_id = r.session_id.clone();
-                }
-            }
+    // 创建 chunk channel（非流式不需要，但 AgentPool::prompt 要求一个）
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+
+    let result = state
+        .pool
+        .prompt(&agent_type, model_id.as_deref(), prompt_text, chunk_tx)
+        .await;
+
+    // 收集所有 chunk
+    let mut collected_text = String::new();
+    let mut collected_thought = String::new();
+    while let Some(event) = chunk_rx.recv().await {
+        match event {
+            StreamEvent::TextChunk(chunk) => collected_text.push_str(&chunk),
+            StreamEvent::ThoughtChunk(chunk) => collected_thought.push_str(&chunk),
         }
-        run
-    })
-    .await;
+    }
 
     match result {
-        Ok(Ok(run)) => {
-            let ptokens = run.prompt_tokens;
-            let ctokens = estimate_tokens(&run.text);
+        Ok(_pr) => {
+            let (tool_calls, cleaned_text) = crate::acp::extract_tool_calls(&collected_text);
+            let ctokens = estimate_tokens(&cleaned_text);
 
-            let has_tool_calls = !run.tool_calls.is_empty();
-            let tool_calls_json: Vec<Value> = run.tool_calls.iter().map(|tc| {
-                json!({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    }
+            let has_tool_calls = !tool_calls.is_empty();
+            let tool_calls_json: Vec<Value> = tool_calls
+                .iter()
+                .map(|tc| {
+                    json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        }
+                    })
                 })
-            }).collect();
+                .collect();
 
             let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
 
             let mut message = json!({
                 "role": "assistant",
-                "content": if run.text.is_empty() { Value::Null } else { Value::String(run.text) },
+                "content": if cleaned_text.is_empty() { Value::Null } else { Value::String(cleaned_text) },
             });
             if has_tool_calls {
                 message["tool_calls"] = Value::Array(tool_calls_json);
             }
 
-            if let Some(reasoning) = &run.reasoning {
-                message["reasoning"] = Value::String(reasoning.clone());
-                message["reasoning_content"] = Value::String(reasoning.clone());
+            if !collected_thought.is_empty() {
+                message["reasoning"] = Value::String(collected_thought.clone());
+                message["reasoning_content"] = Value::String(collected_thought);
             }
 
             let resp = json!({
@@ -564,27 +526,17 @@ async fn chat_completions_json(
                     "finish_reason": finish_reason,
                 }],
                 "usage": {
-                    "prompt_tokens": ptokens,
+                    "prompt_tokens": prompt_tokens,
                     "completion_tokens": ctokens,
-                    "total_tokens": ptokens + ctokens,
+                    "total_tokens": prompt_tokens + ctokens,
                 },
             });
-            tracing::info!("[chat_completions] non-stream response body: {resp}");
 
             Json(resp).into_response()
         }
-        Ok(Err(e)) => {
-            let resp = json!({ "error": { "message": e.to_string() } });
-            tracing::error!("[chat_completions] non-stream response error: {resp}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(resp),
-            )
-                .into_response()
-        }
         Err(e) => {
-            let resp = json!({ "error": { "message": e.to_string() } });
-            tracing::error!("[chat_completions] non-stream response error: {resp}");
+            let msg = e.to_string();
+            let resp = json!({ "error": { "message": msg } });
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(resp),
@@ -597,102 +549,31 @@ async fn chat_completions_json(
 // ── 流式 SSE 响应 ─────────────────────────────────────────────────────────────
 async fn chat_completions_stream(
     state: AppState,
-    _body: ChatCompletionRequest,
-    messages: Vec<ChatMessage>,
+    prompt_text: String,
     agent_type: String,
     model_id: Option<String>,
-    existing_sess: Option<String>,
-    config_opts: Vec<serde_json::Value>,
-    acp_sid: Option<String>,
 ) -> axum::response::Response {
-    let cfg = state.config.clone();
-    let sessions = state.sessions.clone();
-    let sess_id_header = existing_sess.clone();
-
-    // 两个 channel：text chunk 和 thought chunk
-    let (text_tx, mut text_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let (thought_tx, mut thought_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let text_tx = Arc::new(text_tx);
-    let thought_tx = Arc::new(thought_tx);
-
     let cmpl_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created = now_secs();
     let display_model = match &model_id {
         Some(m) => format!("acp/{agent_type}/{m}"),
         None => format!("acp/{agent_type}"),
     };
+    let prompt_tokens = estimate_tokens(&prompt_text);
 
-    let model_id_clone = model_id.clone();
-    let agent_type_clone = agent_type.clone();
+    // 创建 chunk channel — agent 线程通过这个 channel 实时推送 chunk
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
 
-    let prompt_text_for_estimate = messages
-        .iter()
-        .map(|m| {
-            let content_str = m.content
-                .as_ref()
-                .map(|c| c.as_str().unwrap_or("").to_string())
-                .unwrap_or_default();
-            format!("{}: {}", m.role, content_str)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let prompt_tokens = estimate_tokens(&prompt_text_for_estimate);
-
-    // 克隆 tools 和 tool_choice 传给 blocking 线程
-    let tools_for_blocking = _body.tools.clone();
-    let tool_choice_for_blocking = _body.tool_choice.clone();
-
-    // 在 blocking 线程运行 ACP
-    tokio::task::spawn_blocking(move || {
-        let resolved = cfg.resolve_agent(&agent_type_clone);
-        let on_chunk = {
-            let text_tx = text_tx.clone();
-            Some(Arc::new(move |chunk: String| {
-                let _ = text_tx.send(chunk);
-            }) as Arc<dyn Fn(String) + Send + Sync>)
-        };
-        let on_thought_chunk = {
-            let thought_tx = thought_tx.clone();
-            Some(Arc::new(move |chunk: String| {
-                let _ = thought_tx.send(chunk);
-            }) as Arc<dyn Fn(String) + Send + Sync>)
-        };
-
-        let result = run_prompt(
-            &resolved,
-            &agent_type_clone,
-            acp_sid,
-            &messages,
-            on_chunk,
-            on_thought_chunk,
-            None,
-            model_id_clone.as_deref(),
-            if config_opts.is_empty() {
-                None
-            } else {
-                Some(config_opts)
-            },
-            tools_for_blocking.as_deref(),
-            tool_choice_for_blocking.as_ref(),
-        );
-
-        if let Some(sid) = existing_sess {
-            if let Ok(ref run) = &result {
-                if let Some(mut sess) = sessions.get_mut(&sid) {
-                    sess.acp_session_id = run.session_id.clone();
-                }
-            }
-        }
-
-        drop(text_tx);
-        drop(thought_tx);
-        result
+    // 异步发送 prompt（不等待完成，让 chunk 流过来）
+    let pool = state.pool.clone();
+    let _prompt_result_handle = tokio::spawn(async move {
+        pool.prompt(&agent_type, model_id.as_deref(), prompt_text, chunk_tx)
+            .await
     });
 
     // 构建 SSE stream
     let cmpl_id_clone = cmpl_id.clone();
     let display_model_clone = display_model.clone();
-    let sess_id_for_header = sess_id_header.clone();
 
     let stream = async_stream::stream! {
         // 发送 role chunk
@@ -703,14 +584,11 @@ async fn chat_completions_stream(
             "model": display_model_clone,
             "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "" }, "finish_reason": null }],
         });
-        tracing::info!("[chat_completions] SSE chunk: {role_chunk}");
         yield Ok::<String, std::convert::Infallible>(format!("data: {}\n\n", role_chunk));
 
         let mut total_chars = 0usize;
         let mut had_thinking = false;
         let mut thinking_ended = false;
-        let mut thought_closed = false;
-        let mut text_closed = false;
 
         // keepalive：每 15 秒发一个 SSE comment，防止中间件超时断开
         let mut keepalive = tokio::time::interval(Duration::from_secs(15));
@@ -720,13 +598,11 @@ async fn chat_completions_stream(
             tokio::select! {
                 // keepalive 心跳
                 _ = keepalive.tick() => {
-                    // SSE comment 格式：以冒号开头，客户端会忽略
                     yield Ok(": keepalive\n\n".to_string());
-                    tracing::debug!("[chat_completions] SSE keepalive sent");
                 }
-                thought = thought_rx.recv(), if !thought_closed => {
-                    match thought {
-                        Some(chunk) => {
+                event = chunk_rx.recv() => {
+                    match event {
+                        Some(StreamEvent::ThoughtChunk(chunk)) => {
                             if !had_thinking {
                                 had_thinking = true;
                             }
@@ -737,30 +613,9 @@ async fn chat_completions_stream(
                                 "model": display_model_clone,
                                 "choices": [{ "index": 0, "delta": { "reasoning_content": chunk }, "finish_reason": null }],
                             });
-                            tracing::info!("[chat_completions] SSE thinking chunk: {payload}");
                             yield Ok(format!("data: {}\n\n", payload));
                         }
-                        None => {
-                            thought_closed = true;
-                            // thinking 结束标志
-                            if had_thinking && !thinking_ended {
-                                thinking_ended = true;
-                                let thought_end = json!({
-                                    "id": cmpl_id_clone,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": display_model_clone,
-                                    "choices": [{ "index": 0, "delta": { "reasoning_content": "" }, "finish_reason": null }],
-                                });
-                                tracing::info!("[chat_completions] SSE thinking end: {thought_end}");
-                                yield Ok(format!("data: {}\n\n", thought_end));
-                            }
-                        }
-                    }
-                }
-                text = text_rx.recv(), if !text_closed => {
-                    match text {
-                        Some(chunk) => {
+                        Some(StreamEvent::TextChunk(chunk)) => {
                             // 如果还有未结束的 thinking，先结束它
                             if had_thinking && !thinking_ended {
                                 thinking_ended = true;
@@ -771,7 +626,6 @@ async fn chat_completions_stream(
                                     "model": display_model_clone,
                                     "choices": [{ "index": 0, "delta": { "reasoning_content": "" }, "finish_reason": null }],
                                 });
-                                tracing::info!("[chat_completions] SSE thinking end: {thought_end}");
                                 yield Ok(format!("data: {}\n\n", thought_end));
                             }
                             total_chars += chunk.len();
@@ -782,16 +636,27 @@ async fn chat_completions_stream(
                                 "model": display_model_clone,
                                 "choices": [{ "index": 0, "delta": { "content": chunk }, "finish_reason": null }],
                             });
-                            tracing::info!("[chat_completions] SSE chunk: {payload}");
                             yield Ok(format!("data: {}\n\n", payload));
                         }
                         None => {
-                            text_closed = true;
+                            // channel 关闭 = agent 完成了输出
+                            break;
                         }
                     }
                 }
-                else => break,
             }
+        }
+
+        // thinking 未关闭时补上结束标记
+        if had_thinking && !thinking_ended {
+            let thought_end = json!({
+                "id": cmpl_id_clone,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": display_model_clone,
+                "choices": [{ "index": 0, "delta": { "reasoning_content": "" }, "finish_reason": null }],
+            });
+            yield Ok(format!("data: {}\n\n", thought_end));
         }
 
         let completion_tokens = estimate_tokens(&"x".repeat(total_chars));
@@ -807,9 +672,7 @@ async fn chat_completions_stream(
                 "total_tokens": prompt_tokens + completion_tokens,
             },
         });
-        tracing::info!("[chat_completions] SSE chunk: {stop_chunk}");
         yield Ok(format!("data: {}\n\n", stop_chunk));
-        tracing::info!("[chat_completions] SSE chunk: [DONE]");
         yield Ok("data: [DONE]\n\n".to_string());
     };
 
@@ -820,11 +683,6 @@ async fn chat_completions_stream(
     );
     headers.insert("cache-control", "no-cache".parse().unwrap());
     headers.insert("connection", "keep-alive".parse().unwrap());
-    if let Some(sid) = sess_id_for_header {
-        if let Ok(v) = sid.parse() {
-            headers.insert("x-session-id", v);
-        }
-    }
 
     (headers, Body::from_stream(stream)).into_response()
 }
@@ -834,8 +692,6 @@ async fn completions(
     State(state): State<AppState>,
     Json(body): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
-    tracing::info!("[completions] request body: {}", serde_json::to_string(&body).unwrap_or_else(|e| format!("<serialize error: {e}>")));
-
     let messages = match extract_prompt(&body) {
         Some(m) => m,
         None => {
@@ -847,112 +703,87 @@ async fn completions(
         }
     };
 
-    let (agent_type, model_id, existing_sess, config_opts, acp_sid) =
-        if let Some(sid) = &body.session_id {
-            match state.sessions.get(sid.as_str()) {
-                None => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(json!({ "error": { "message": format!("session {sid} not found") } })),
-                    )
-                        .into_response();
-                }
-                Some(sess) => (
-                    sess.agent_type.clone(),
-                    sess.model_id.clone(),
-                    Some(sid.clone()),
-                    sess.config_options.clone(),
-                    Some(sess.acp_session_id.clone()),
-                ),
+    let (agent_type, model_id) = if let Some(sid) = &body.session_id {
+        match state.sessions.get(sid.as_str()) {
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": { "message": format!("session {sid} not found") } })),
+                )
+                    .into_response();
             }
-        } else {
-            let raw_model = match &body.model {
-                Some(m) if !m.trim().is_empty() => m.trim().to_string(),
-                _ => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": { "message": "model or session_id required" } })),
-                    )
-                        .into_response();
-                }
-            };
-            let (agent, model) = parse_model(&raw_model);
-            (agent, model, None, vec![], None)
+            Some(sess) => (sess.agent_type.clone(), sess.model_id.clone()),
+        }
+    } else {
+        let raw_model = match &body.model {
+            Some(m) if !m.trim().is_empty() => m.trim().to_string(),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": { "message": "model or session_id required" } })),
+                )
+                    .into_response();
+            }
         };
+        let (agent, model) = parse_model(&raw_model);
+        (agent, model)
+    };
 
-    let cfg = state.config.clone();
-    let sessions = state.sessions.clone();
+    let prompt_text = crate::acp::build_prompt(&messages, body.tools.as_deref(), body.tool_choice.as_ref());
     let display_model = match &model_id {
         Some(m) => format!("acp/{agent_type}/{m}"),
         None => format!("acp/{agent_type}"),
     };
+    let prompt_tokens = estimate_tokens(&prompt_text);
 
-    // 克隆 tools 和 tool_choice
-    let tools_clone = body.tools.clone();
-    let tool_choice_clone = body.tool_choice.clone();
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+    let result = state
+        .pool
+        .prompt(&agent_type, model_id.as_deref(), prompt_text, chunk_tx)
+        .await;
 
-    let result = tokio::task::spawn_blocking(move || {
-        let resolved = cfg.resolve_agent(&agent_type);
-        let run = run_prompt(
-            &resolved,
-            &agent_type,
-            acp_sid,
-            &messages,
-            None,
-            None,
-            None,
-            model_id.as_deref(),
-            if config_opts.is_empty() {
-                None
-            } else {
-                Some(config_opts)
-            },
-            tools_clone.as_deref(),
-            tool_choice_clone.as_ref(),
-        );
-        if let Some(sid) = existing_sess {
-            if let Ok(ref r) = run {
-                if let Some(mut sess) = sessions.get_mut(&sid) {
-                    sess.acp_session_id = r.session_id.clone();
-                }
-            }
+    let mut collected_text = String::new();
+    let mut collected_thought = String::new();
+    while let Some(event) = chunk_rx.recv().await {
+        match event {
+            StreamEvent::TextChunk(chunk) => collected_text.push_str(&chunk),
+            StreamEvent::ThoughtChunk(chunk) => collected_thought.push_str(&chunk),
         }
-        run
-    })
-    .await;
+    }
 
     match result {
-        Ok(Ok(run)) => {
-            let ptokens = run.prompt_tokens;
-            let ctokens = estimate_tokens(&run.text);
+        Ok(_pr) => {
+            let (tool_calls, cleaned_text) = crate::acp::extract_tool_calls(&collected_text);
+            let ctokens = estimate_tokens(&cleaned_text);
 
-            // 构建 tool_calls 响应
-            let has_tool_calls = !run.tool_calls.is_empty();
-            let tool_calls_json: Vec<Value> = run.tool_calls.iter().map(|tc| {
-                json!({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    }
+            let has_tool_calls = !tool_calls.is_empty();
+            let tool_calls_json: Vec<Value> = tool_calls
+                .iter()
+                .map(|tc| {
+                    json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        }
+                    })
                 })
-            }).collect();
+                .collect();
 
             let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
 
             let mut message = json!({
                 "role": "assistant",
-                "content": if run.text.is_empty() { Value::Null } else { Value::String(run.text) },
+                "content": if cleaned_text.is_empty() { Value::Null } else { Value::String(cleaned_text) },
             });
             if has_tool_calls {
                 message["tool_calls"] = Value::Array(tool_calls_json);
             }
 
-            // 添加 reasoning（如果存在）
-            if let Some(reasoning) = &run.reasoning {
-                message["reasoning"] = Value::String(reasoning.clone());
-                message["reasoning_content"] = Value::String(reasoning.clone());
+            if !collected_thought.is_empty() {
+                message["reasoning"] = Value::String(collected_thought.clone());
+                message["reasoning_content"] = Value::String(collected_thought);
             }
 
             let resp = json!({
@@ -966,27 +797,17 @@ async fn completions(
                     "finish_reason": finish_reason,
                 }],
                 "usage": {
-                    "prompt_tokens": ptokens,
+                    "prompt_tokens": prompt_tokens,
                     "completion_tokens": ctokens,
-                    "total_tokens": ptokens + ctokens,
+                    "total_tokens": prompt_tokens + ctokens,
                 },
             });
-            tracing::info!("[completions] response body: {resp}");
 
             Json(resp).into_response()
         }
-        Ok(Err(e)) => {
-            let resp = json!({ "error": { "message": e.to_string() } });
-            tracing::error!("[completions] response error: {resp}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(resp),
-            )
-                .into_response()
-        }
         Err(e) => {
-            let resp = json!({ "error": { "message": e.to_string() } });
-            tracing::error!("[completions] response error: {resp}");
+            let msg = e.to_string();
+            let resp = json!({ "error": { "message": msg } });
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(resp),
@@ -1005,10 +826,12 @@ async fn main() {
         .init();
 
     let config = Arc::new(Config::load());
+    let pool = Arc::new(AgentPool::new(config.clone()));
     let sessions = new_store();
 
     let state = AppState {
         config: config.clone(),
+        pool,
         sessions,
         models_cache: Arc::new(Mutex::new(None)),
     };
@@ -1054,7 +877,7 @@ async fn main() {
     let agents = config.agent_names();
     eprintln!();
     eprintln!("╔══════════════════════════════════════╗");
-    eprintln!("║   hermes-agent-acp-bridge  v0.1.0    ║");
+    eprintln!("║   hermes-agent-acp-bridge  v0.2.0    ║");
     eprintln!("║   ACP → OpenAI Protocol Gateway      ║");
     eprintln!("╚══════════════════════════════════════╝");
     eprintln!();
