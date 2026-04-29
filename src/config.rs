@@ -8,6 +8,11 @@ pub struct AgentConfig {
     pub env: Option<HashMap<String, String>>,
     pub startup_delay_secs: Option<u64>,
     pub models: Option<Vec<ModelEntry>>,
+    /// When true, treat this ACP agent as a bare LLM:
+    /// inject tool schemas into the prompt and parse <tool_call> blocks from the response.
+    /// When false (default), the agent runs autonomously — tools are not injected.
+    #[serde(default)]
+    pub llm_mode: bool,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -95,7 +100,9 @@ impl Config {
             .and_then(|a| a.models.clone())
             .unwrap_or_default();
 
-        ResolvedAgent { command, args, env, startup_delay_secs: startup_delay, static_models }
+        let llm_mode = agent_cfg.map(|a| a.llm_mode).unwrap_or(false);
+
+        ResolvedAgent { command, args, env, startup_delay_secs: startup_delay, static_models, llm_mode }
     }
 }
 
@@ -105,6 +112,7 @@ pub struct ResolvedAgent {
     pub env: HashMap<String, String>,
     pub startup_delay_secs: u64,
     pub static_models: Vec<ModelEntry>,
+    pub llm_mode: bool,
 }
 
 fn expand_home(s: String) -> String {

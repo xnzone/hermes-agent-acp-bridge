@@ -226,7 +226,7 @@ async fn create_session(
     State(state): State<AppState>,
     Json(body): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
-    tracing::info!("[create_session] request body: {}", serde_json::to_string(&body).unwrap_or_else(|e| format!("<serialize error: {e}>")));
+    tracing::debug!("[create_session] request body: {}", serde_json::to_string(&body).unwrap_or_else(|e| format!("<serialize error: {e}>")));
 
     let (agent_type, model_id) = parse_model(&body.model);
     let sessions = state.sessions.clone();
@@ -395,7 +395,7 @@ async fn chat_completions(
     State(state): State<AppState>,
     Json(body): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
-    tracing::info!("[chat_completions] request body: {}", serde_json::to_string(&body).unwrap_or_else(|e| format!("<serialize error: {e}>")));
+    tracing::debug!("[chat_completions] request body: {}", serde_json::to_string(&body).unwrap_or_else(|e| format!("<serialize error: {e}>")));
 
     let is_stream = body.stream.unwrap_or(false);
 
@@ -438,8 +438,10 @@ async fn chat_completions(
         (agent, model)
     };
 
-    // 构建 prompt 文本（复用 acp.rs 中的 build_prompt 逻辑）
-    let prompt_text = crate::acp::build_prompt(&messages, body.tools.as_deref(), body.tool_choice.as_ref());
+    // 构建 prompt 文本：如果是 tool roundtrip（末尾是 role:tool），只发新增的 tool result；
+    // 否则发完整历史（首轮对话）。ACP session 长期保留历史，不需要每轮重发全量。
+    let prompt_text = crate::acp::build_incremental_prompt(&messages)
+        .unwrap_or_else(|| crate::acp::build_prompt(&messages, body.tools.as_deref(), body.tool_choice.as_ref()));
 
     if is_stream {
         chat_completions_stream(state, prompt_text, agent_type, model_id).await
@@ -482,11 +484,9 @@ async fn chat_completions_json(
 
     match result {
         Ok(_pr) => {
-            let (tool_calls, cleaned_text) = crate::acp::extract_tool_calls(&collected_text);
-            let ctokens = estimate_tokens(&cleaned_text);
-
-            let has_tool_calls = !tool_calls.is_empty();
-            let tool_calls_json: Vec<Value> = tool_calls
+            // 从文本中提取 <tool_call> 块（agent 要求 Hermes 执行的工具调用）
+            let (extracted, cleaned_text) = crate::acp::extract_tool_calls(&collected_text);
+            let tool_calls_json: Vec<Value> = extracted
                 .iter()
                 .map(|tc| {
                     json!({
@@ -500,6 +500,8 @@ async fn chat_completions_json(
                 })
                 .collect();
 
+            let ctokens = estimate_tokens(&cleaned_text);
+            let has_tool_calls = !tool_calls_json.is_empty();
             let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
 
             let mut message = json!({
@@ -589,6 +591,8 @@ async fn chat_completions_stream(
         let mut total_chars = 0usize;
         let mut had_thinking = false;
         let mut thinking_ended = false;
+        // 文本内容收集（用于流结束时提取 <tool_call> 块）
+        let mut collected_text = String::new();
 
         loop {
             match chunk_rx.recv().await {
@@ -619,6 +623,7 @@ async fn chat_completions_stream(
                         yield Ok(format!("data: {}\n\n", thought_end));
                     }
                     total_chars += chunk.len();
+                    collected_text.push_str(&chunk);
                     let payload = json!({
                         "id": cmpl_id_clone,
                         "object": "chat.completion.chunk",
@@ -647,13 +652,46 @@ async fn chat_completions_stream(
             yield Ok(format!("data: {}\n\n", thought_end));
         }
 
+        // 从文本中提取 <tool_call> 块（agent 要求 Hermes 执行的工具调用）
+        let (extracted_tcs, _) = crate::acp::extract_tool_calls(&collected_text);
+        let finish_reason = if !extracted_tcs.is_empty() {
+            // 流式发出所有提取到的 tool_call delta
+            for (idx, tc) in extracted_tcs.iter().enumerate() {
+                let tc_delta = json!({
+                    "id": cmpl_id_clone,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": display_model_clone,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": idx,
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                }
+                            }]
+                        },
+                        "finish_reason": null
+                    }],
+                });
+                yield Ok(format!("data: {}\n\n", tc_delta));
+            }
+            "tool_calls"
+        } else {
+            "stop"
+        };
+
         let completion_tokens = estimate_tokens(&"x".repeat(total_chars));
         let stop_chunk = json!({
             "id": cmpl_id_clone,
             "object": "chat.completion.chunk",
             "created": created,
             "model": display_model_clone,
-            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
@@ -674,8 +712,6 @@ async fn chat_completions_stream(
 
     (headers, Body::from_stream(stream)).into_response()
 }
-
-// POST /v1/completions — 非流式（支持 tool_calls 提取）
 async fn completions(
     State(state): State<AppState>,
     Json(body): Json<ChatCompletionRequest>,
@@ -717,7 +753,8 @@ async fn completions(
         (agent, model)
     };
 
-    let prompt_text = crate::acp::build_prompt(&messages, body.tools.as_deref(), body.tool_choice.as_ref());
+    let prompt_text = crate::acp::build_incremental_prompt(&messages)
+        .unwrap_or_else(|| crate::acp::build_prompt(&messages, body.tools.as_deref(), body.tool_choice.as_ref()));
     let display_model = match &model_id {
         Some(m) => format!("acp/{agent_type}/{m}"),
         None => format!("acp/{agent_type}"),
@@ -729,7 +766,7 @@ async fn completions(
         .pool
         .prompt(&agent_type, model_id.as_deref(), prompt_text, chunk_tx)
         .await;
-
+    // 收集所有 chunk
     let mut collected_text = String::new();
     let mut collected_thought = String::new();
     while let Some(event) = chunk_rx.recv().await {
@@ -741,11 +778,9 @@ async fn completions(
 
     match result {
         Ok(_pr) => {
-            let (tool_calls, cleaned_text) = crate::acp::extract_tool_calls(&collected_text);
-            let ctokens = estimate_tokens(&cleaned_text);
-
-            let has_tool_calls = !tool_calls.is_empty();
-            let tool_calls_json: Vec<Value> = tool_calls
+            // 从文本中提取 <tool_call> 块
+            let (extracted, cleaned_text) = crate::acp::extract_tool_calls(&collected_text);
+            let tool_calls_json: Vec<Value> = extracted
                 .iter()
                 .map(|tc| {
                     json!({
@@ -759,6 +794,8 @@ async fn completions(
                 })
                 .collect();
 
+            let ctokens = estimate_tokens(&cleaned_text);
+            let has_tool_calls = !tool_calls_json.is_empty();
             let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
 
             let mut message = json!({

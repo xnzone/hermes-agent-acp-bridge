@@ -1,83 +1,31 @@
-/// ACP agent 通信核心
-use std::{sync::Arc, time::Duration};
+/// ACP agent 通信核心 (agent-client-protocol 0.11)
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use agent_client_protocol::{
-    self as acp, Agent, ClientSideConnection, ContentBlock, InitializeRequest, NewSessionRequest,
-    PromptRequest, ProtocolVersion, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, TextContent,
+    Agent, ByteStreams, Client, ConnectionTo,
+    schema::{
+        ContentBlock, InitializeRequest, NewSessionRequest,
+        PromptRequest, TextContent,
+        ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
+        RequestPermissionResponse, ReadTextFileRequest, ReadTextFileResponse,
+        SetSessionConfigOptionRequest, SessionConfigId, SessionConfigValueId,
+        WriteTextFileRequest, WriteTextFileResponse,
+    },
+    on_receive_request, on_receive_notification,
+    Responder,
 };
+use agent_client_protocol::schema::{SessionNotification, SessionUpdate};
 use anyhow::{Context, Result};
 use regex::Regex;
-
-use agent_client_protocol::Error as AcpError;
-type AcpResult<T> = std::result::Result<T, AcpError>;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
-use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::config::ResolvedAgent;
 
-// ─── 权限回调类型 ──────────────────────────────────────────────────────────────
-
-pub type PermissionCallback = Arc<dyn Fn(serde_json::Value) -> bool + Send + Sync>;
-
-// ─── 内部 Channel 消息（旧版 run_prompt 使用，新版本在 agent_pool.rs）──────
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-enum StreamEvent {
-    TextChunk(String),
-    ThoughtChunk(String),
-}
-
-// ─── 内部 Client 实现 ─────────────────────────────────────────────────────────
-
-struct OurClient {
-    tx: mpsc::UnboundedSender<StreamEvent>,
-    #[allow(dead_code)]
-    perm_cb: Option<PermissionCallback>,
-}
-
-#[async_trait::async_trait(?Send)]
-impl acp::Client for OurClient {
-    async fn session_notification(&self, args: SessionNotification) -> AcpResult<()> {
-        match &args.update {
-            SessionUpdate::AgentMessageChunk(chunk) => {
-                if let ContentBlock::Text(TextContent { text, .. }) = &chunk.content {
-                    if !text.is_empty() {
-                        let _ = self.tx.send(StreamEvent::TextChunk(text.clone()));
-                    }
-                }
-            }
-            SessionUpdate::AgentThoughtChunk(chunk) => {
-                if let ContentBlock::Text(TextContent { text, .. }) = &chunk.content {
-                    if !text.is_empty() {
-                        let _ = self.tx.send(StreamEvent::ThoughtChunk(text.clone()));
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    async fn request_permission(
-        &self,
-        _args: acp::RequestPermissionRequest,
-    ) -> AcpResult<acp::RequestPermissionResponse> {
-        Ok(acp::RequestPermissionResponse::new(
-            acp::RequestPermissionOutcome::Cancelled,
-        ))
-    }
-}
-
 // ─── 工具调用提取 ─────────────────────────────────────────────────────────────
 
 /// 从 ACP agent 的文本输出中提取 OpenAI 格式的 tool_calls
-///
-/// agent 可能以两种格式输出工具调用:
-/// 1. `<tool_call>{...}</tool_call>` XML 块格式（注意开始标签无 >，匹配 Python 正则）
-/// 2. 裸 JSON 格式（仅当没有 XML 块时尝试）
 pub fn extract_tool_calls(text: &str) -> (Vec<ExtractedToolCall>, String) {
     if text.trim().is_empty() {
         return (vec![], String::new());
@@ -87,7 +35,7 @@ pub fn extract_tool_calls(text: &str) -> (Vec<ExtractedToolCall>, String) {
     let mut consumed_spans: Vec<(usize, usize)> = vec![];
     let mut call_counter = 0u32;
 
-    // 模式1: <tool_call>{...}</tool_call> 块 (匹配 Python: r" XCTool_call\s*(\{.*?\})\s* XCTool_call")
+    // 模式1: <tool_call>{...}</tool_call>
     let block_re = Regex::new(r"(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>").unwrap();
     for cap in block_re.captures_iter(text) {
         let m = cap.get(0).unwrap();
@@ -117,7 +65,6 @@ pub fn extract_tool_calls(text: &str) -> (Vec<ExtractedToolCall>, String) {
         return (extracted, text.trim().to_string());
     }
 
-    // 从原文中移除被消费的 tool call 块，得到干净的文本
     consumed_spans.sort();
     let merged = merge_spans(&consumed_spans);
     let mut parts: Vec<&str> = vec![];
@@ -199,32 +146,39 @@ fn merge_spans(spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
 pub fn run_prompt(
     resolved: &ResolvedAgent,
     agent_type: &str,
-    acp_session_id: Option<String>,
+    _acp_session_id: Option<String>,
     messages: &[ChatMessage],
     on_chunk: Option<Arc<dyn Fn(String) + Send + Sync>>,
     on_thought_chunk: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    perm_cb: Option<PermissionCallback>,
+    _perm_cb: Option<Arc<dyn Fn(serde_json::Value) -> bool + Send + Sync>>,
     model_name: Option<&str>,
     config_options_cache: Option<Vec<serde_json::Value>>,
     tools: Option<&[serde_json::Value]>,
     tool_choice: Option<&serde_json::Value>,
 ) -> Result<RunResult> {
-    let prompt_text = build_prompt(messages, tools, tool_choice);
+    // agent 模式（llm_mode=false）不注入 tool schema，让 agent 自主完成任务
+    let (effective_tools, effective_tool_choice) = if resolved.llm_mode {
+        (tools, tool_choice)
+    } else {
+        (None, None)
+    };
+    let prompt_text = build_prompt(messages, effective_tools, effective_tool_choice);
+    let llm_mode = resolved.llm_mode;
+    let prompt_tokens_precomputed = estimate_tokens(&prompt_text);
     let command = resolved.command.clone();
     let args = resolved.args.clone();
     let env = resolved.env.clone();
     let startup_delay = resolved.startup_delay_secs;
     let agent_type = agent_type.to_string();
     let model_name = model_name.map(|s| s.to_string());
-    let cached_opts = config_options_cache;
+    let _cached_opts = config_options_cache;
 
     std::thread::spawn(move || -> Result<RunResult> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let local = tokio::task::LocalSet::new();
 
-        rt.block_on(local.run_until(async move {
+        rt.block_on(async move {
             let mut child = Command::new(&command)
                 .args(&args)
                 .envs(&env)
@@ -236,7 +190,7 @@ pub fn run_prompt(
 
             let stderr = child.stderr.take().unwrap();
             let agent_tag = agent_type.clone();
-            tokio::task::spawn_local(async move {
+            tokio::spawn(async move {
                 use tokio::io::AsyncBufReadExt;
                 let mut lines = tokio::io::BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -248,142 +202,191 @@ pub fn run_prompt(
                 tokio::time::sleep(Duration::from_secs(startup_delay)).await;
             }
 
-            let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
 
-            let client = OurClient { tx, perm_cb };
+            let collected_text = Arc::new(tokio::sync::Mutex::new(String::new()));
+            let collected_thought = Arc::new(tokio::sync::Mutex::new(String::new()));
+            let sess_id_out = Arc::new(tokio::sync::Mutex::new(String::new()));
+            let config_opts_out = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
 
-            let stdin_compat = child.stdin.take().unwrap().compat_write();
-            let stdout_compat = child.stdout.take().unwrap().compat();
+            let collected_text_cl = collected_text.clone();
+            let collected_thought_cl = collected_thought.clone();
+            let sess_id_out_cl = sess_id_out.clone();
+            let config_opts_out_cl = config_opts_out.clone();
+            let on_chunk_cl = on_chunk.clone();
+            let on_thought_cl = on_thought_chunk.clone();
 
-            let (conn, io_fut) =
-                ClientSideConnection::new(client, stdin_compat, stdout_compat, |fut| {
-                    tokio::task::spawn_local(fut);
-                });
+            Client
+                .builder()
+                // 处理 session update notifications（chunks）
+                .on_receive_notification(
+                    move |notif: SessionNotification, _cx| {
+                        let text_cl = collected_text_cl.clone();
+                        let thought_cl = collected_thought_cl.clone();
+                        let on_chunk = on_chunk_cl.clone();
+                        let on_thought = on_thought_cl.clone();
+                        async move {
+                            match &notif.update {
+                                SessionUpdate::AgentMessageChunk(chunk) => {
+                                    if let ContentBlock::Text(t) = &chunk.content {
+                                        if !t.text.is_empty() {
+                                            if let Some(cb) = &on_chunk { cb(t.text.clone()); }
+                                            text_cl.lock().await.push_str(&t.text);
+                                        }
+                                    }
+                                }
+                                SessionUpdate::AgentThoughtChunk(chunk) => {
+                                    if let ContentBlock::Text(t) = &chunk.content {
+                                        if !t.text.is_empty() {
+                                            if let Some(cb) = &on_thought { cb(t.text.clone()); }
+                                            thought_cl.lock().await.push_str(&t.text);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            Ok(())
+                        }
+                    },
+                    on_receive_notification!(),
+                )
+                // 处理 fs/read_text_file
+                .on_receive_request(
+                    async move |req: ReadTextFileRequest, responder: Responder<ReadTextFileResponse>, _cx| {
+                        let path = req.path.clone();
+                        let line = req.line;
+                        let limit = req.limit;
+                        tokio::spawn(async move {
+                            let result = tokio::fs::read_to_string(&path).await;
+                            let content = match result {
+                                Ok(s) => {
+                                    if let Some(line_start) = line {
+                                        let lines: Vec<&str> = s.lines().collect();
+                                        let start = (line_start as usize).saturating_sub(1);
+                                        let end = if let Some(lim) = limit {
+                                            (start + lim as usize).min(lines.len())
+                                        } else {
+                                            lines.len()
+                                        };
+                                        lines[start..end].join("\n")
+                                    } else {
+                                        s
+                                    }
+                                }
+                                Err(_) => String::new(),
+                            };
+                            responder.respond(ReadTextFileResponse::new(content))
+                        });
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                // 处理 fs/write_text_file
+                .on_receive_request(
+                    async move |req: WriteTextFileRequest, responder: Responder<WriteTextFileResponse>, _cx| {
+                        tokio::spawn(async move {
+                            if let Some(parent) = req.path.parent() {
+                                let _ = tokio::fs::create_dir_all(parent).await;
+                            }
+                            let _ = tokio::fs::write(&req.path, &req.content).await;
+                            responder.respond(WriteTextFileResponse::new())
+                        });
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                // 处理 session/request_permission — 始终 cancel
+                .on_receive_request(
+                    async move |_req: RequestPermissionRequest, responder, _cx| {
+                        let _ = responder.respond(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Cancelled,
+                        ));
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                .connect_with(transport, async move |cx: ConnectionTo<Agent>| {
+                    // initialize
+                    cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
 
-            tokio::task::spawn_local(async move {
-                let _ = io_fut.await;
-            });
+                    // new session
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+                    let new_sess_resp = cx
+                        .send_request(NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await?;
 
-            // initialize
-            conn.initialize(InitializeRequest::new(ProtocolVersion::LATEST))
-                .await
-                .context("initialize failed")?;
-
-            // new session or reuse
-            let (sess_id, config_opts): (String, Vec<serde_json::Value>) =
-                if let Some(sid) = acp_session_id {
-                    (sid, cached_opts.unwrap_or_default())
-                } else {
-                    let cwd = std::env::current_dir().unwrap_or_default();
-                    let resp = conn
-                        .new_session(NewSessionRequest::new(cwd))
-                        .await
-                        .context("new_session failed")?;
-                    let opts = serde_json::to_value(&resp)
+                    let sess_id = new_sess_resp.session_id.clone();
+                    let opts: Vec<serde_json::Value> = serde_json::to_value(&new_sess_resp)
                         .ok()
                         .and_then(|v| v.get("configOptions").cloned())
                         .and_then(|v| serde_json::from_value(v).ok())
                         .unwrap_or_default();
-                    (resp.session_id.to_string(), opts)
-                };
 
-            // 切换模型
-            if let Some(model) = &model_name {
-                switch_model(&conn, &sess_id, model, &config_opts, &agent_type).await;
-            }
+                    *sess_id_out_cl.lock().await = sess_id.to_string();
+                    *config_opts_out_cl.lock().await = opts.clone();
 
-            // 并发：prompt 执行期间同时 drain stream events
-            // 这样 on_chunk 回调能在 prompt() await 期间实时触发，
-            // 而不是等 prompt() 完成后再批量处理
-            let (prompt_done_tx, mut prompt_done_rx) =
-                tokio::sync::oneshot::channel::<()>();
-
-            // 后台任务：持续从 rx 读取 stream events 并调用回调
-            let on_chunk_clone = on_chunk.clone();
-            let on_thought_chunk_clone = on_thought_chunk.clone();
-            let drain_handle = tokio::task::spawn_local(async move {
-                let mut collected_text = String::new();
-                let mut collected_thought = String::new();
-
-                loop {
-                    tokio::select! {
-                        event = rx.recv() => {
-                            match event {
-                                Some(StreamEvent::TextChunk(chunk)) => {
-                                    if let Some(cb) = &on_chunk_clone {
-                                        cb(chunk.clone());
-                                    }
-                                    collected_text.push_str(&chunk);
-                                }
-                                Some(StreamEvent::ThoughtChunk(chunk)) => {
-                                    if let Some(cb) = &on_thought_chunk_clone {
-                                        cb(chunk.clone());
-                                    }
-                                    collected_thought.push_str(&chunk);
-                                }
-                                None => break,
-                            }
-                        }
-                        _ = &mut prompt_done_rx => {
-                            // prompt 完成了，但继续 drain 剩余 events
-                            // 直到 channel 关闭（conn drop 后 tx 被 drop）
-                            while let Some(event) = rx.recv().await {
-                                match event {
-                                    StreamEvent::TextChunk(chunk) => {
-                                        if let Some(cb) = &on_chunk_clone {
-                                            cb(chunk.clone());
-                                        }
-                                        collected_text.push_str(&chunk);
-                                    }
-                                    StreamEvent::ThoughtChunk(chunk) => {
-                                        if let Some(cb) = &on_thought_chunk_clone {
-                                            cb(chunk.clone());
-                                        }
-                                        collected_thought.push_str(&chunk);
-                                    }
-                                }
-                            }
-                            break;
-                        }
+                    // 切换模型
+                    if let Some(ref model) = model_name {
+                        switch_model(&cx, &sess_id.to_string(), model, &opts, &agent_type).await;
                     }
-                }
 
-                (collected_text, collected_thought)
-            });
+                    // 发送 prompt，等待完成（chunks 通过 on_receive_notification 推送）
+                    cx.send_request(PromptRequest::new(
+                        sess_id,
+                        vec![ContentBlock::Text(TextContent::new(prompt_text))],
+                    ))
+                    .block_task()
+                    .await?;
 
-            // prompt
-            let prompt_req = PromptRequest::new(
-                SessionId::from(sess_id.clone()),
-                vec![ContentBlock::Text(TextContent::new(prompt_text.clone()))],
-            );
-            let _resp = conn.prompt(prompt_req).await.context("prompt failed")?;
-
-            // 通知 drain 任务 prompt 已完成
-            let _ = prompt_done_tx.send(());
-            // drop conn 让 tx 被 drop，从而 rx.recv() 返回 None
-            drop(conn);
-
-            // 等待 drain 完成
-            let (collected_text, collected_thought) = drain_handle.await?;
+                    Ok(())
+                })
+                .await?;
 
             let _ = child.kill().await;
 
-            // 提取 tool calls
-            let (tool_calls, cleaned_text) = extract_tool_calls(&collected_text);
+            let collected_text = Arc::try_unwrap(collected_text)
+                .unwrap_or_else(|a| tokio::sync::Mutex::new(a.blocking_lock().clone()))
+                .into_inner();
+            let collected_thought = Arc::try_unwrap(collected_thought)
+                .unwrap_or_else(|a| tokio::sync::Mutex::new(a.blocking_lock().clone()))
+                .into_inner();
+            let sess_id = Arc::try_unwrap(sess_id_out)
+                .unwrap_or_else(|a| tokio::sync::Mutex::new(a.blocking_lock().clone()))
+                .into_inner();
+            let config_opts = Arc::try_unwrap(config_opts_out)
+                .unwrap_or_else(|a| tokio::sync::Mutex::new(a.blocking_lock().clone()))
+                .into_inner();
+
+            tracing::debug!("[acp] raw collected_text (first 2000 chars):\n{}", &collected_text[..collected_text.len().min(2000)]);
+            let (tool_calls, cleaned_text) = if llm_mode {
+                extract_tool_calls(&collected_text)
+            } else {
+                (vec![], collected_text.clone())
+            };
+            if tool_calls.is_empty() {
+                tracing::debug!("[acp] no tool_calls extracted from agent output");
+            } else {
+                for tc in &tool_calls {
+                    tracing::info!("[acp] extracted tool_call: id={} name={} args={}", tc.id, tc.function.name, &tc.function.arguments[..tc.function.arguments.len().min(200)]);
+                }
+            }
+
+            let prompt_tokens = prompt_tokens_precomputed;
 
             Ok(RunResult {
                 text: cleaned_text,
-                reasoning: if collected_thought.is_empty() {
-                    None
-                } else {
-                    Some(collected_thought)
-                },
+                reasoning: if collected_thought.is_empty() { None } else { Some(collected_thought) },
                 tool_calls,
                 session_id: sess_id,
                 config_options: config_opts,
-                prompt_tokens: estimate_tokens(&prompt_text),
+                prompt_tokens,
             })
-        }))
+        })
     })
     .join()
     .map_err(|_| anyhow::anyhow!("thread panicked"))?
@@ -418,10 +421,9 @@ pub fn query_models(
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let local = tokio::task::LocalSet::new();
 
         let timeout = Duration::from_secs(timeout_secs);
-        rt.block_on(local.run_until(async move {
+        rt.block_on(async move {
             let inner = async {
                 let mut child = Command::new(&command)
                     .args(&args)
@@ -435,84 +437,87 @@ pub fn query_models(
                     tokio::time::sleep(Duration::from_secs(startup_delay)).await;
                 }
 
-                let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
-                let client = OurClient { tx, perm_cb: None };
+                let stdin = child.stdin.take().unwrap();
+                let stdout = child.stdout.take().unwrap();
+                let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
 
-                let stdin_compat = child.stdin.take().unwrap().compat_write();
-                let stdout_compat = child.stdout.take().unwrap().compat();
+                let config_opts_out: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
+                    Arc::new(tokio::sync::Mutex::new(vec![]));
+                let config_opts_cl = config_opts_out.clone();
 
-                let (conn, io_fut) =
-                    ClientSideConnection::new(client, stdin_compat, stdout_compat, |fut| {
-                        tokio::task::spawn_local(fut);
-                    });
+                Client
+                    .builder()
+                    .on_receive_request(
+                        async move |_req: RequestPermissionRequest, responder, _cx| {
+                            let _ = responder.respond(RequestPermissionResponse::new(
+                                RequestPermissionOutcome::Cancelled,
+                            ));
+                            Ok(())
+                        },
+                        on_receive_request!(),
+                    )
+                    .connect_with(transport, async move |cx: ConnectionTo<Agent>| {
+                        cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                            .block_task()
+                            .await?;
 
-                tokio::task::spawn_local(async move {
-                    let _ = io_fut.await;
-                });
+                        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+                        let (_, opts) = cx
+                            .build_session(cwd)
+                            .block_task()
+                            .run_until(async |session| {
+                                let resp_val = serde_json::to_value(session.response())
+                                    .unwrap_or_default();
+                                let opts: Vec<serde_json::Value> = resp_val
+                                    .get("configOptions")
+                                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                                    .unwrap_or_default();
+                                Ok((session.session_id().clone(), opts))
+                            })
+                            .await?;
 
-                conn.initialize(InitializeRequest::new(ProtocolVersion::LATEST))
+                        *config_opts_cl.lock().await = opts;
+                        Ok(())
+                    })
                     .await?;
-
-                let cwd = std::env::current_dir().unwrap_or_default();
-                let resp = conn.new_session(NewSessionRequest::new(cwd)).await?;
-                let resp_val = serde_json::to_value(&resp).unwrap_or_default();
 
                 let _ = child.kill().await;
 
-                // ACP 标准 models.availableModels
-                if let Some(models) = resp_val
-                    .get("models")
-                    .and_then(|m| m.get("availableModels"))
-                    .and_then(|v| v.as_array())
-                {
-                    let ids: Vec<(String, u64)> = models
-                        .iter()
-                        .filter_map(|m| {
-                            m.get("modelId").and_then(|v| v.as_str()).map(|s| {
-                                let id = format!("acp/{agent_type}/{s}");
-                                let ctx = infer_context_window(s);
-                                (id, ctx)
-                            })
-                        })
-                        .collect();
-                    if !ids.is_empty() {
-                        return Ok(ids);
-                    }
-                }
+                let opts = Arc::try_unwrap(config_opts_out)
+                    .unwrap_or_else(|a| tokio::sync::Mutex::new(a.blocking_lock().clone()))
+                    .into_inner();
 
                 // fallback: configOptions[id="model"].options[].name
-                if let Some(opts) = resp_val.get("configOptions").and_then(|v| v.as_array()) {
-                    if let Some(model_opt) = opts.iter().find(|o| {
-                        o.get("id").and_then(|v| v.as_str()) == Some("model")
-                            && o.get("type").and_then(|v| v.as_str()) == Some("select")
-                    }) {
-                        if let Some(options) = model_opt.get("options").and_then(|v| v.as_array()) {
-                            let ids: Vec<(String, u64)> = options
-                                .iter()
-                                .filter_map(|o| {
-                                    o.get("name").and_then(|v| v.as_str()).map(|n| {
-                                        let id = format!("acp/{agent_type}/{n}");
-                                        let ctx = infer_context_window(n);
-                                        (id, ctx)
-                                    })
+                if let Some(model_opt) = opts.iter().find(|o| {
+                    o.get("id").and_then(|v| v.as_str()) == Some("model")
+                        && o.get("type").and_then(|v| v.as_str()) == Some("select")
+                }) {
+                    if let Some(options) = model_opt.get("options").and_then(|v| v.as_array()) {
+                        let ids: Vec<(String, u64)> = options
+                            .iter()
+                            .filter_map(|o| {
+                                o.get("name").and_then(|v| v.as_str()).map(|n| {
+                                    let id = format!("acp/{agent_type}/{n}");
+                                    let ctx = infer_context_window(n);
+                                    (id, ctx)
                                 })
-                                .collect();
-                            if !ids.is_empty() {
-                                return Ok(ids);
-                            }
+                            })
+                            .collect();
+                        if !ids.is_empty() {
+                            return Ok(ids);
                         }
                     }
                 }
 
                 Ok(vec![(format!("acp/{agent_type}"), 128_000u64)])
-            }; // end inner
+            };
             tokio::time::timeout(timeout, inner)
                 .await
                 .unwrap_or_else(|_| {
                     tracing::warn!("[{agent_type}] query_models timed out after {timeout_secs}s");
                     Ok(vec![(format!("acp/{agent_type}"), 128_000u64)])
                 })
-        }))
+        })
     })
     .join();
 
@@ -528,9 +533,8 @@ pub fn query_models(
 
 // ─── 辅助 ─────────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 async fn switch_model(
-    conn: &ClientSideConnection,
+    cx: &ConnectionTo<Agent>,
     sess_id: &str,
     model_name: &str,
     config_opts: &[serde_json::Value],
@@ -555,18 +559,48 @@ async fn switch_model(
         .unwrap_or_else(|| model_name.to_string());
 
     let req = SetSessionConfigOptionRequest::new(
-        SessionId::from(sess_id.to_string()),
-        "model",
-        config_value.clone(),
+        agent_client_protocol::schema::SessionId::from(sess_id.to_string()),
+        SessionConfigId::from(Arc::from("model")),
+        SessionConfigValueId::from(Arc::from(config_value.as_str())),
     );
 
-    match conn.set_session_config_option(req).await {
+    match cx.send_request(req).block_task().await {
         Ok(_) => tracing::info!("[{agent_type}] model switched to {config_value}"),
         Err(e) => tracing::warn!("[{agent_type}] switch model failed: {e}"),
     }
 }
 
-/// 构建 prompt 文本，包含工具定义和指令（参考 copilot_acp_client.py 的 _format_messages_as_prompt）
+/// 判断是否是工具调用 roundtrip（messages 末尾有 role:tool 消息）
+pub fn build_incremental_prompt(messages: &[ChatMessage]) -> Option<String> {
+    let tool_start = messages
+        .iter()
+        .rposition(|m| m.role != "tool")
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    if tool_start >= messages.len() || messages[tool_start].role != "tool" {
+        return None;
+    }
+
+    let tool_msgs = &messages[tool_start..];
+    let mut parts: Vec<String> = vec![
+        "The following tool results have been returned. Read them and continue your response.".to_string(),
+    ];
+
+    for msg in tool_msgs {
+        let content = msg.content.as_ref().map(|c| render_content(c)).unwrap_or_default();
+        let tool_call_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
+        let fn_name = msg.name.as_deref().unwrap_or("unknown");
+        parts.push(format!(
+            "<tool_result>\n<tool_call_id>{}</tool_call_id>\n<function>{}</function>\n<result>{}</result>\n</tool_result>",
+            tool_call_id, fn_name, content
+        ));
+    }
+
+    Some(parts.join("\n\n"))
+}
+
+/// 构建 prompt 文本
 pub fn build_prompt(
     messages: &[ChatMessage],
     tools: Option<&[serde_json::Value]>,
@@ -574,15 +608,19 @@ pub fn build_prompt(
 ) -> String {
     let mut sections: Vec<String> = vec![];
 
-    // 系统指令
-    sections.push("You are being used as the active ACP agent backend for Hermes.".to_string());
-    sections.push("Use ACP capabilities to complete tasks.".to_string());
+    sections.push("You are a language model assistant. Respond to the user's request directly.".to_string());
     sections.push(
-        "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.".to_string()
+        "CRITICAL RULES — read carefully:\n\
+         1. DO NOT use bash, shell, terminal, or any execution tools.\n\
+         2. DO NOT autonomously execute any commands or scripts.\n\
+         3. Your ONLY job is to think and respond in plain text.\n\
+         4. If the conversation includes an 'Available tools' section, you must declare tool usage \
+            by outputting a <tool_call> JSON block in your response text — do NOT execute anything yourself.\n\
+         5. If no tools are listed, just answer the question normally.\n\
+         6. When you see <tool_result> blocks, those are results already executed by the caller — \
+            read them and continue your response.".to_string()
     );
-    sections.push("If no tool is needed, answer normally.".to_string());
 
-    // 工具定义
     if let Some(tools) = tools {
         if !tools.is_empty() {
             let mut tool_specs: Vec<serde_json::Value> = vec![];
@@ -614,7 +652,6 @@ pub fn build_prompt(
         }
     }
 
-    // tool_choice
     if let Some(tc) = tool_choice {
         sections.push(format!(
             "Tool choice hint: {}",
@@ -622,7 +659,6 @@ pub fn build_prompt(
         ));
     }
 
-    // 对话记录
     let mut transcript: Vec<String> = vec![];
     for msg in messages {
         let label = match msg.role.as_str() {
@@ -633,13 +669,11 @@ pub fn build_prompt(
             _ => "Context",
         };
 
-        // 渲染 content
         let mut rendered = String::new();
         if let Some(content) = &msg.content {
             rendered = render_content(content);
         }
 
-        // 对于 assistant 消息，如果有 tool_calls，也要包含
         if msg.role == "assistant" {
             if let Some(tool_calls) = &msg.tool_calls {
                 for tc in tool_calls {
@@ -659,16 +693,15 @@ pub fn build_prompt(
             }
         }
 
-        // 对于 tool 消息，包含 tool_call_id 和 name
         if msg.role == "tool" {
-            if let Some(name) = &msg.name {
-                rendered = format!(
-                    "[tool_call_id: {}, function: {}]\n{}",
-                    msg.tool_call_id.as_deref().unwrap_or("unknown"),
-                    name,
-                    rendered
-                );
-            }
+            let tool_call_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
+            let fn_name = msg.name.as_deref().unwrap_or("unknown");
+            rendered = format!(
+                "<tool_result>\n<tool_call_id>{}</tool_call_id>\n<function>{}</function>\n<result>{}</result>\n</tool_result>",
+                tool_call_id,
+                fn_name,
+                rendered
+            );
         }
 
         if !rendered.trim().is_empty() {
@@ -693,7 +726,6 @@ pub fn build_prompt(
         .join("\n\n")
 }
 
-/// 渲染消息 content（支持字符串、对象、数组）
 fn render_content(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(s) => s.trim().to_string(),
@@ -733,7 +765,6 @@ pub fn estimate_tokens(text: &str) -> u32 {
     (text.len() as f32 / 4.0).ceil() as u32
 }
 
-/// 根据模型名称关键词推断 context_window（token 数）
 pub fn infer_context_window(model_name: &str) -> u64 {
     let n = model_name.to_lowercase();
     if n.contains("claude-3-5") || n.contains("claude-3.5") {
@@ -778,7 +809,6 @@ pub struct ChatMessage {
     pub name: Option<String>,
 }
 
-/// 从 agent 输出中提取的 tool call
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExtractedToolCall {
     pub id: String,
@@ -805,4 +835,4 @@ pub struct RunResult {
     pub prompt_tokens: u32,
 }
 
-use serde::{Deserialize, Serialize};
+// Re-export SessionId for use in session reuse

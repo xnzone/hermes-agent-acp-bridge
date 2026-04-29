@@ -1,18 +1,27 @@
 /// 持久 Agent 进程池
 ///
 /// 每个 (agent_type, model_id) 对应一个持久化的 agent 子进程。
-/// 子进程运行在专用线程的 LocalSet 上（因为 ClientSideConnection 是 !Send）。
-/// 外部通过 channel 发送 prompt 请求，agent 线程实时推送 StreamEvent chunk。
+/// 子进程在专用线程运行，通过 channel 接收 prompt 请求，实时推送 StreamEvent chunk。
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::{
-    self as acp, Agent, ClientSideConnection, ContentBlock, InitializeRequest, NewSessionRequest,
-    PromptRequest, ProtocolVersion, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, TextContent,
+    Agent, ByteStreams, Client, ConnectionTo,
+    on_receive_notification, on_receive_request,
+    Responder,
+    schema::{
+        ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind,
+        PromptRequest, ProtocolVersion,
+        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+        ReadTextFileRequest, ReadTextFileResponse, SelectedPermissionOutcome,
+        SessionConfigId, SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
+        SetSessionConfigOptionRequest, TextContent, ToolCallStatus,
+        WriteTextFileRequest, WriteTextFileResponse,
+    },
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -76,11 +85,9 @@ impl AgentPool {
     ) -> Result<PromptResult> {
         let key = pool_key(agent_type, model_id);
 
-        // 获取或创建 agent 句柄
         let req_tx = {
             let mut pool = self.agents.lock().await;
 
-            // 检查已有句柄是否还活着（channel 未关闭）
             let alive = pool
                 .get(&key)
                 .map(|h| !h.req_tx.is_closed())
@@ -92,7 +99,6 @@ impl AgentPool {
                     pool.remove(&key);
                 }
 
-                // 启动新 agent 线程
                 let handle = spawn_agent_thread(&self.config, agent_type, model_id).await?;
                 pool.insert(key.clone(), handle);
             }
@@ -100,7 +106,6 @@ impl AgentPool {
             pool.get(&key).unwrap().req_tx.clone()
         };
 
-        // 发送 prompt 请求
         let (done_tx, done_rx) = oneshot::channel::<Result<String>>();
         let req = PromptReq {
             prompt_text,
@@ -112,7 +117,6 @@ impl AgentPool {
             .send(req)
             .map_err(|_| anyhow::anyhow!("agent thread channel closed"))?;
 
-        // 等待完成
         let session_id = done_rx
             .await
             .map_err(|_| anyhow::anyhow!("agent thread dropped done_tx"))??;
@@ -120,7 +124,7 @@ impl AgentPool {
         Ok(PromptResult { session_id })
     }
 
-    /// 获取 agent 的 session 信息（session_id, config_options）
+    /// 获取 agent 的 session 信息
     pub async fn get_session_info(
         &self,
         agent_type: &str,
@@ -142,7 +146,17 @@ fn pool_key(agent_type: &str, model_id: Option<&str>) -> PoolKey {
     }
 }
 
-/// 启动一个专用线程运行 agent 进程和 LocalSet，返回通信句柄
+fn tool_status_str(status: &ToolCallStatus) -> &'static str {
+    match status {
+        ToolCallStatus::Pending => "pending",
+        ToolCallStatus::InProgress => "in_progress",
+        ToolCallStatus::Completed => "completed",
+        ToolCallStatus::Failed => "failed",
+        _ => "unknown",
+    }
+}
+
+/// 启动一个专用线程运行 agent 进程，返回通信句柄
 async fn spawn_agent_thread(
     config: &Arc<Config>,
     agent_type: &str,
@@ -152,18 +166,17 @@ async fn spawn_agent_thread(
     let agent_type = agent_type.to_string();
     let model_id = model_id.map(|s| s.to_string());
 
-    // 用 oneshot 等待 agent 初始化完成
-    let (init_tx, init_rx) = oneshot::channel::<Result<(String, Vec<serde_json::Value>, mpsc::UnboundedSender<PromptReq>)>>();
+    let (init_tx, init_rx) =
+        oneshot::channel::<Result<(String, Vec<serde_json::Value>, mpsc::UnboundedSender<PromptReq>)>>();
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build tokio runtime");
-        let local = tokio::task::LocalSet::new();
 
-        rt.block_on(local.run_until(async move {
-            // 启动 agent 子进程
+        rt.block_on(async move {
+            // 启动子进程
             let mut child = match Command::new(&resolved.command)
                 .args(&resolved.args)
                 .envs(&resolved.env)
@@ -182,7 +195,7 @@ async fn spawn_agent_thread(
             // stderr 日志
             let stderr = child.stderr.take().unwrap();
             let agent_tag = agent_type.clone();
-            tokio::task::spawn_local(async move {
+            tokio::spawn(async move {
                 use tokio::io::AsyncBufReadExt;
                 let mut lines = tokio::io::BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -194,116 +207,240 @@ async fn spawn_agent_thread(
                 tokio::time::sleep(Duration::from_secs(resolved.startup_delay_secs)).await;
             }
 
-            // 创建 ACP 连接（使用一个占位 tx，后续每次 prompt 会替换）
-            let (placeholder_tx, _) = mpsc::unbounded_channel::<StreamEvent>();
-            // 用 Arc<Mutex<...>> 让 OurClient 能动态切换 chunk_tx
-            let current_tx: Arc<std::sync::Mutex<mpsc::UnboundedSender<StreamEvent>>> =
-                Arc::new(std::sync::Mutex::new(placeholder_tx));
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
 
-            let client = DynamicClient {
-                current_tx: current_tx.clone(),
-            };
+            // req channel
+            let (req_tx, req_rx) = mpsc::unbounded_channel::<PromptReq>();
+            // 用来在 notification handler 里推送 chunk
+            let current_chunk_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<StreamEvent>>>> =
+                Arc::new(tokio::sync::Mutex::new(None));
 
-            let stdin_compat = child.stdin.take().unwrap().compat_write();
-            let stdout_compat = child.stdout.take().unwrap().compat();
+            let chunk_tx_notif = current_chunk_tx.clone();
+            let _chunk_tx_notif2 = current_chunk_tx.clone();
 
-            let (conn, io_fut) =
-                ClientSideConnection::new(client, stdin_compat, stdout_compat, |fut| {
-                    tokio::task::spawn_local(fut);
-                });
+            // init_tx 用 Arc<Mutex<Option<...>>> 传进 connect_with 闭包
+            let init_tx_cell = Arc::new(std::sync::Mutex::new(Some(init_tx)));
+            let init_tx_cl = init_tx_cell.clone();
 
-            tokio::task::spawn_local(async move {
-                let _ = io_fut.await;
-            });
+            let req_tx_cl = req_tx.clone();
+            let model_id_cl = model_id.clone();
+            let agent_type_cl = agent_type.clone();
 
-            // initialize
-            if let Err(e) = conn
-                .initialize(InitializeRequest::new(ProtocolVersion::LATEST))
-                .await
-                .context("initialize failed")
-            {
-                let _ = init_tx.send(Err(e));
-                return;
-            }
+            // req_rx 传进闭包（必须 move），但 mpsc::UnboundedReceiver 不是 Clone
+            // 用 Arc<Mutex<Option<...>>> 包裹
+            let req_rx_cell = Arc::new(tokio::sync::Mutex::new(Some(req_rx)));
 
-            // new session
-            let cwd = std::env::current_dir().unwrap_or_default();
-            let resp = match conn.new_session(NewSessionRequest::new(cwd)).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = init_tx.send(Err(anyhow::anyhow!("new_session failed: {e}")));
-                    return;
-                }
-            };
+            let result = Client
+                .builder()
+                .on_receive_notification(
+                    move |notif: SessionNotification, _cx| {
+                        let tx_cell = chunk_tx_notif.clone();
+                        async move {
+                            let maybe_tx = tx_cell.lock().await;
+                            let tx = match &*maybe_tx {
+                                Some(t) => t.clone(),
+                                None => return Ok(()),
+                            };
+                            drop(maybe_tx); // 释放锁
 
-            let session_id = resp.session_id.to_string();
-            let config_options: Vec<serde_json::Value> = serde_json::to_value(&resp)
-                .ok()
-                .and_then(|v| v.get("configOptions").cloned())
-                .and_then(|v| serde_json::from_value(v).ok())
-                .unwrap_or_default();
+                            match &notif.update {
+                                SessionUpdate::AgentMessageChunk(chunk) => {
+                                    if let ContentBlock::Text(t) = &chunk.content {
+                                        if !t.text.is_empty() {
+                                            let _ = tx.send(StreamEvent::TextChunk(t.text.clone()));
+                                        }
+                                    }
+                                }
+                                SessionUpdate::AgentThoughtChunk(chunk) => {
+                                    if let ContentBlock::Text(t) = &chunk.content {
+                                        if !t.text.is_empty() {
+                                            let _ = tx.send(StreamEvent::ThoughtChunk(t.text.clone()));
+                                        }
+                                    }
+                                }
+                                SessionUpdate::ToolCall(tc) => {
+                                    let status_str = tool_status_str(&tc.status);
+                                    let thought = format!("[tool:{:?}] {} ({})", tc.kind, tc.title, status_str);
+                                    tracing::debug!(
+                                        "[acp] ToolCall id={} title={:?} kind={:?} status={}",
+                                        tc.tool_call_id, tc.title, tc.kind, status_str
+                                    );
+                                    let _ = tx.send(StreamEvent::ThoughtChunk(thought));
+                                }
+                                SessionUpdate::ToolCallUpdate(upd) => {
+                                    let status_str = upd.fields.status
+                                        .as_ref()
+                                        .map(|s| tool_status_str(s))
+                                        .unwrap_or("update");
+                                    tracing::debug!(
+                                        "[acp] ToolCallUpdate id={} status={}",
+                                        upd.tool_call_id, status_str
+                                    );
+                                    if matches!(
+                                        upd.fields.status,
+                                        Some(ToolCallStatus::Completed) | Some(ToolCallStatus::Failed)
+                                    ) {
+                                        let title = upd.fields.title.as_deref().unwrap_or("tool");
+                                        let thought = format!("[tool:{status_str}] {title}");
+                                        let _ = tx.send(StreamEvent::ThoughtChunk(thought));
+                                    }
+                                }
+                                _ => {}
+                            }
+                            Ok(())
+                        }
+                    },
+                    on_receive_notification!(),
+                )
+                .on_receive_request(
+                    move |req: ReadTextFileRequest, responder: Responder<ReadTextFileResponse>, _cx| {
+                        async move {
+                            let path = req.path.clone();
+                            let line = req.line;
+                            let limit = req.limit;
+                            tokio::spawn(async move {
+                                let content = match tokio::fs::read_to_string(&path).await {
+                                    Ok(s) => {
+                                        if let Some(line_start) = line {
+                                            let lines: Vec<&str> = s.lines().collect();
+                                            let start = (line_start as usize).saturating_sub(1);
+                                            let end = if let Some(lim) = limit {
+                                                (start + lim as usize).min(lines.len())
+                                            } else {
+                                                lines.len()
+                                            };
+                                            lines[start..end].join("\n")
+                                        } else {
+                                            s
+                                        }
+                                    }
+                                    Err(_) => String::new(),
+                                };
+                                let _ = responder.respond(ReadTextFileResponse::new(content));
+                            });
+                            Ok(())
+                        }
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    move |req: WriteTextFileRequest, responder: Responder<WriteTextFileResponse>, _cx| {
+                        async move {
+                            tokio::spawn(async move {
+                                if let Some(parent) = req.path.parent() {
+                                    let _ = tokio::fs::create_dir_all(parent).await;
+                                }
+                                let _ = tokio::fs::write(&req.path, &req.content).await;
+                                let _ = responder.respond(WriteTextFileResponse::new());
+                            });
+                            Ok(())
+                        }
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    move |req: RequestPermissionRequest, responder: Responder<RequestPermissionResponse>, _cx| {
+                        async move {
+                            let allow_option = req.options.iter()
+                                .find(|o| matches!(o.kind, PermissionOptionKind::AllowAlways))
+                                .or_else(|| req.options.iter()
+                                    .find(|o| matches!(o.kind, PermissionOptionKind::AllowOnce)));
 
-            // 切换模型
-            if let Some(model) = &model_id {
-                switch_model(&conn, &session_id, model, &config_options, &agent_type).await;
-            }
+                            let outcome = if let Some(opt) = allow_option {
+                                tracing::debug!("[acp] auto-allowing permission option_id={:?}", opt.option_id);
+                                RequestPermissionOutcome::Selected(
+                                    SelectedPermissionOutcome::new(opt.option_id.clone()),
+                                )
+                            } else {
+                                tracing::warn!("[acp] no allow option found, cancelling permission request");
+                                RequestPermissionOutcome::Cancelled
+                            };
+                            let _ = responder.respond(RequestPermissionResponse::new(outcome));
+                            Ok(())
+                        }
+                    },
+                    on_receive_request!(),
+                )
+                .connect_with(transport, move |cx: ConnectionTo<Agent>| async move {
+                    // initialize
+                    cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
 
-            // 创建 prompt 请求 channel
-            let (req_tx, mut req_rx) = mpsc::unbounded_channel::<PromptReq>();
+                    // new session
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+                    let new_sess_resp = cx
+                        .send_request(NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await?;
 
-            // 通知初始化完成
-            if init_tx
-                .send(Ok((session_id.clone(), config_options, req_tx)))
-                .is_err()
-            {
-                return;
-            }
+                    let session_id = new_sess_resp.session_id.to_string();
+                    let config_opts: Vec<serde_json::Value> = serde_json::to_value(&new_sess_resp)
+                        .ok()
+                        .and_then(|v| v.get("configOptions").cloned())
+                        .and_then(|v| serde_json::from_value(v).ok())
+                        .unwrap_or_default();
 
-            // 主循环：处理 prompt 请求
-            while let Some(req) = req_rx.recv().await {
-                let PromptReq {
-                    prompt_text,
-                    chunk_tx,
-                    done_tx,
-                } = req;
-
-                // 更新当前 chunk_tx，让 DynamicClient 推送到正确的 channel
-                {
-                    let mut tx_guard = current_tx.lock().unwrap();
-                    *tx_guard = chunk_tx;
-                }
-
-                // 发送 prompt
-                let prompt_req = PromptRequest::new(
-                    SessionId::from(session_id.clone()),
-                    vec![ContentBlock::Text(TextContent::new(prompt_text))],
-                );
-
-                let result = conn.prompt(prompt_req).await;
-
-                // 关闭当前 chunk_tx（用占位符替换），触发 rx 端 recv() 返回 None
-                let (placeholder_tx, _) = mpsc::unbounded_channel::<StreamEvent>();
-                {
-                    let mut tx_guard = current_tx.lock().unwrap();
-                    *tx_guard = placeholder_tx;
-                }
-
-                match result {
-                    Ok(_) => {
-                        let _ = done_tx.send(Ok(session_id.clone()));
+                    // 切换模型
+                    if let Some(model) = &model_id_cl {
+                        switch_model(&cx, &session_id, model, &config_opts, &agent_type_cl).await;
                     }
-                    Err(e) => {
-                        let _ = done_tx.send(Err(anyhow::anyhow!("prompt failed: {e}")));
+
+                    // 通知初始化完成
+                    if let Some(tx) = init_tx_cl.lock().unwrap().take() {
+                        let _ = tx.send(Ok((session_id.clone(), config_opts, req_tx_cl)));
                     }
+
+                    // 主循环：持续处理 prompt 请求
+                    let sess_id = SessionId::from(session_id.clone());
+                    let mut req_rx_guard = req_rx_cell.lock().await;
+                    let req_rx = req_rx_guard.as_mut().unwrap();
+
+                    loop {
+                        let req = match req_rx.recv().await {
+                            Some(r) => r,
+                            None => break,
+                        };
+
+                        let PromptReq { prompt_text, chunk_tx, done_tx } = req;
+
+                        // 设置当前 chunk_tx
+                        *current_chunk_tx.lock().await = Some(chunk_tx);
+
+                        let prompt_result = cx
+                            .send_request(PromptRequest::new(
+                                sess_id.clone(),
+                                vec![ContentBlock::Text(TextContent::new(prompt_text))],
+                            ))
+                            .block_task()
+                            .await;
+
+                        // 清空 chunk_tx（触发 stream 完成）
+                        *current_chunk_tx.lock().await = None;
+
+                        match prompt_result {
+                            Ok(_) => { let _ = done_tx.send(Ok(session_id.clone())); }
+                            Err(e) => { let _ = done_tx.send(Err(anyhow::anyhow!("prompt failed: {e}"))); }
+                        }
+                    }
+
+                    Ok(())
+                })
+                .await;
+
+            if let Err(e) = result {
+                tracing::error!("[{agent_type}] agent connection error: {e}");
+                if let Some(tx) = init_tx_cell.lock().unwrap().take() {
+                    let _ = tx.send(Err(anyhow::anyhow!("agent connection error: {e}")));
                 }
             }
 
-            // req_rx 关闭，清理子进程
             let _ = child.kill().await;
-        }));
+        });
     });
 
-    // 等待初始化完成
     let (session_id, config_options, req_tx) = init_rx
         .await
         .map_err(|_| anyhow::anyhow!("agent thread panicked during init"))??;
@@ -315,55 +452,10 @@ async fn spawn_agent_thread(
     })
 }
 
-// ─── DynamicClient：动态切换 chunk_tx ────────────────────────────────────────
-
-/// 每次 prompt 时动态切换推送目标 channel
-struct DynamicClient {
-    current_tx: Arc<std::sync::Mutex<mpsc::UnboundedSender<StreamEvent>>>,
-}
-
-#[async_trait::async_trait(?Send)]
-impl acp::Client for DynamicClient {
-    async fn session_notification(
-        &self,
-        args: SessionNotification,
-    ) -> agent_client_protocol::Result<()> {
-        match &args.update {
-            SessionUpdate::AgentMessageChunk(chunk) => {
-                if let ContentBlock::Text(TextContent { text, .. }) = &chunk.content {
-                    if !text.is_empty() {
-                        let tx = self.current_tx.lock().unwrap().clone();
-                        let _ = tx.send(StreamEvent::TextChunk(text.clone()));
-                    }
-                }
-            }
-            SessionUpdate::AgentThoughtChunk(chunk) => {
-                if let ContentBlock::Text(TextContent { text, .. }) = &chunk.content {
-                    if !text.is_empty() {
-                        let tx = self.current_tx.lock().unwrap().clone();
-                        let _ = tx.send(StreamEvent::ThoughtChunk(text.clone()));
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    async fn request_permission(
-        &self,
-        _args: acp::RequestPermissionRequest,
-    ) -> agent_client_protocol::Result<acp::RequestPermissionResponse> {
-        Ok(acp::RequestPermissionResponse::new(
-            acp::RequestPermissionOutcome::Cancelled,
-        ))
-    }
-}
-
 // ─── 切换模型 ─────────────────────────────────────────────────────────────────
 
 async fn switch_model(
-    conn: &ClientSideConnection,
+    cx: &ConnectionTo<Agent>,
     sess_id: &str,
     model_name: &str,
     config_opts: &[serde_json::Value],
@@ -389,11 +481,11 @@ async fn switch_model(
 
     let req = SetSessionConfigOptionRequest::new(
         SessionId::from(sess_id.to_string()),
-        "model",
-        config_value.clone(),
+        SessionConfigId::new("model"),
+        SessionConfigValueId::new(config_value.as_str()),
     );
 
-    match conn.set_session_config_option(req).await {
+    match cx.send_request(req).block_task().await {
         Ok(_) => tracing::info!("[{agent_type}] model switched to {config_value}"),
         Err(e) => tracing::warn!("[{agent_type}] switch model failed: {e}"),
     }
