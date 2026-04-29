@@ -782,7 +782,7 @@ pub fn infer_context_window(_model_name: &str) -> u64 {
 /// 例如: "TME GLM-5.1" -> "tme-glm-5.1", "Claude Sonnet 4.6" -> "claude-sonnet-4.6"
 pub fn normalize_model_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c.to_ascii_lowercase() } else { '-' })
         .collect::<String>()
         .split('-')
         .filter(|s| !s.is_empty())
