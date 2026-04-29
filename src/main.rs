@@ -200,11 +200,12 @@ async fn list_models(State(state): State<AppState>) -> Json<Value> {
     for res in results {
         if let Ok(models) = res {
             for (id, ctx) in models {
+                let owned_by = id.split('/').next().unwrap_or("hab").to_string();
                 data.push(json!({
                     "id": id,
                     "object": "model",
                     "created": now,
-                    "owned_by": "haab",
+                    "owned_by": owned_by,
                     "context_window": ctx,
                 }));
             }
