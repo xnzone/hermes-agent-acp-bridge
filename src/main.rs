@@ -91,15 +91,14 @@ struct ApproveRequest {
 // ─── Parse model string ───────────────────────────────────────────────────────
 
 fn parse_model(model: &str) -> (String, Option<String>) {
-    if let Some(rest) = model.strip_prefix("acp/") {
-        if let Some(slash) = rest.find('/') {
-            let agent = rest[..slash].to_string();
-            let model_id = rest[slash + 1..].to_string();
-            return (agent, Some(model_id));
-        }
-        return (rest.to_string(), None);
+    // 兼容旧的 "acp/agent/model" 格式，也支持新的 "agent/model" 格式
+    let s = model.strip_prefix("acp/").unwrap_or(model);
+    if let Some(slash) = s.find('/') {
+        let agent = s[..slash].to_string();
+        let model_id = s[slash + 1..].to_string();
+        return (agent, Some(model_id));
     }
-    (model.to_string(), None)
+    (s.to_string(), None)
 }
 
 /// 将请求中的 ChatMessageReq 转换为内部 ChatMessage
@@ -458,8 +457,8 @@ async fn chat_completions_json(
     model_id: Option<String>,
 ) -> axum::response::Response {
     let display_model = match &model_id {
-        Some(m) => format!("acp/{agent_type}/{m}"),
-        None => format!("acp/{agent_type}"),
+        Some(m) => format!("{agent_type}/{m}"),
+        None => format!("{agent_type}"),
     };
 
     let prompt_tokens = estimate_tokens(&prompt_text);
@@ -558,8 +557,8 @@ async fn chat_completions_stream(
     let cmpl_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created = now_secs();
     let display_model = match &model_id {
-        Some(m) => format!("acp/{agent_type}/{m}"),
-        None => format!("acp/{agent_type}"),
+        Some(m) => format!("{agent_type}/{m}"),
+        None => format!("{agent_type}"),
     };
     let prompt_tokens = estimate_tokens(&prompt_text);
 
@@ -756,8 +755,8 @@ async fn completions(
     let prompt_text = crate::acp::build_incremental_prompt(&messages)
         .unwrap_or_else(|| crate::acp::build_prompt(&messages, body.tools.as_deref(), body.tool_choice.as_ref()));
     let display_model = match &model_id {
-        Some(m) => format!("acp/{agent_type}/{m}"),
-        None => format!("acp/{agent_type}"),
+        Some(m) => format!("{agent_type}/{m}"),
+        None => format!("{agent_type}"),
     };
     let prompt_tokens = estimate_tokens(&prompt_text);
 

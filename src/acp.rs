@@ -403,13 +403,13 @@ pub fn query_models(
             .static_models
             .iter()
             .map(|m| {
-                let id = format!("acp/{agent_type}/{}", m.name);
+                let id = format!("{agent_type}/{}", m.name);
                 let ctx = m.context_window.unwrap_or_else(|| infer_context_window(&m.name));
                 (id, ctx)
             })
             .collect()
     } else {
-        vec![(format!("acp/{agent_type}"), 128_000u64)]
+        vec![(format!("{agent_type}"), 128_000u64)]
     };
 
     let command = resolved.command.clone();
@@ -497,7 +497,7 @@ pub fn query_models(
                             .iter()
                             .filter_map(|o| {
                                 o.get("name").and_then(|v| v.as_str()).map(|n| {
-                                    let id = format!("acp/{agent_type_str}/{n}");
+                                    let id = format!("{agent_type_str}/{n}");
                                     let ctx = infer_context_window(n);
                                     (id, ctx)
                                 })
