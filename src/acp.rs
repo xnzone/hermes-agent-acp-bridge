@@ -403,13 +403,13 @@ pub fn query_models(
             .static_models
             .iter()
             .map(|m| {
-                let id = format!("{agent_type}/{}", m.name);
+                let id = format!("{agent_type}/{}", normalize_model_name(&m.name));
                 let ctx = m.context_window.unwrap_or_else(|| infer_context_window(&m.name));
                 (id, ctx)
             })
             .collect()
     } else {
-        vec![(format!("{agent_type}"), 128_000u64)]
+        vec![(format!("{agent_type}"), 200_000u64)]
     };
 
     let command = resolved.command.clone();
@@ -497,7 +497,7 @@ pub fn query_models(
                             .iter()
                             .filter_map(|o| {
                                 o.get("name").and_then(|v| v.as_str()).map(|n| {
-                                    let id = format!("{agent_type_str}/{n}");
+                                    let id = format!("{agent_type_str}/{}", normalize_model_name(n));
                                     let ctx = infer_context_window(n);
                                     (id, ctx)
                                 })
@@ -556,8 +556,11 @@ async fn switch_model(
         .and_then(|v| v.as_array())
         .and_then(|options| {
             options.iter().find(|o| {
-                o.get("name").and_then(|v| v.as_str()) == Some(model_name)
-                    || o.get("value").and_then(|v| v.as_str()) == Some(model_name)
+                let opt_name = o.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let opt_value = o.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                normalize_model_name(opt_name) == model_name
+                    || opt_name == model_name
+                    || opt_value == model_name
             })
         })
         .and_then(|o| o.get("value").and_then(|v| v.as_str()))
@@ -771,37 +774,20 @@ pub fn estimate_tokens(text: &str) -> u32 {
     (text.len() as f32 / 4.0).ceil() as u32
 }
 
-pub fn infer_context_window(model_name: &str) -> u64 {
-    let n = model_name.to_lowercase();
-    if n.contains("claude-3-5") || n.contains("claude-3.5") {
-        200_000
-    } else if n.contains("claude") {
-        200_000
-    } else if n.contains("gemini-1.5-pro") {
-        1_048_576
-    } else if n.contains("gemini-2") || n.contains("gemini-1.5") {
-        1_000_000
-    } else if n.contains("gemini") {
-        128_000
-    } else if n.contains("gpt-4o") || n.contains("gpt-4-turbo") {
-        128_000
-    } else if n.contains("gpt-4") {
-        8_192
-    } else if n.contains("gpt-3.5") {
-        16_385
-    } else if n.contains("deepseek-r1") || n.contains("deepseek-v3") {
-        128_000
-    } else if n.contains("deepseek") {
-        128_000
-    } else if n.contains("qwen") || n.contains("qwq") {
-        128_000
-    } else if n.contains("llama-3") {
-        128_000
-    } else if n.contains("mistral") || n.contains("mixtral") {
-        32_000
-    } else {
-        128_000
-    }
+pub fn infer_context_window(_model_name: &str) -> u64 {
+    200_000
+}
+
+/// 把模型名规范化为小写 + 连字符格式
+/// 例如: "TME GLM-5.1" -> "tme-glm-5.1", "Claude Sonnet 4.6" -> "claude-sonnet-4.6"
+pub fn normalize_model_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c.to_ascii_lowercase() } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 // ─── 公开数据类型 ─────────────────────────────────────────────────────────────
