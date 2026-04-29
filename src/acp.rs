@@ -397,9 +397,9 @@ pub fn query_models(
     agent_type: &str,
     timeout_secs: u64,
 ) -> Vec<(String, u64)> {
-    // 如果配置了静态模型列表，直接返回，跳过动态查询
-    if !resolved.static_models.is_empty() {
-        return resolved
+    // static_models 只作为 fallback，优先尝试 ACP 动态查询
+    let static_fallback: Vec<(String, u64)> = if !resolved.static_models.is_empty() {
+        resolved
             .static_models
             .iter()
             .map(|m| {
@@ -407,15 +407,18 @@ pub fn query_models(
                 let ctx = m.context_window.unwrap_or_else(|| infer_context_window(&m.name));
                 (id, ctx)
             })
-            .collect();
-    }
+            .collect()
+    } else {
+        vec![(format!("acp/{agent_type}"), 128_000u64)]
+    };
 
-    let fallback = vec![(format!("acp/{agent_type}"), 128_000u64)];
     let command = resolved.command.clone();
     let args = resolved.args.clone();
     let env = resolved.env.clone();
     let startup_delay = resolved.startup_delay_secs;
-    let agent_type = agent_type.to_string();
+    let agent_type_str = agent_type.to_string();
+    let fallback_clone = static_fallback.clone();
+    let fallback_timeout = static_fallback.clone();
 
     let result = std::thread::spawn(move || -> Result<Vec<(String, u64)>> {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -462,19 +465,16 @@ pub fn query_models(
                             .await?;
 
                         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-                        let (_, opts) = cx
-                            .build_session(cwd)
+                        let new_sess_resp = cx
+                            .send_request(NewSessionRequest::new(cwd))
                             .block_task()
-                            .run_until(async |session| {
-                                let resp_val = serde_json::to_value(session.response())
-                                    .unwrap_or_default();
-                                let opts: Vec<serde_json::Value> = resp_val
-                                    .get("configOptions")
-                                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                                    .unwrap_or_default();
-                                Ok((session.session_id().clone(), opts))
-                            })
                             .await?;
+
+                        let opts: Vec<serde_json::Value> = serde_json::to_value(&new_sess_resp)
+                            .ok()
+                            .and_then(|v| v.get("configOptions").cloned())
+                            .and_then(|v| serde_json::from_value(v).ok())
+                            .unwrap_or_default();
 
                         *config_opts_cl.lock().await = opts;
                         Ok(())
@@ -487,7 +487,7 @@ pub fn query_models(
                     .unwrap_or_else(|a| tokio::sync::Mutex::new(a.blocking_lock().clone()))
                     .into_inner();
 
-                // fallback: configOptions[id="model"].options[].name
+                // 从 configOptions[id="model"].options[].name 提取模型列表
                 if let Some(model_opt) = opts.iter().find(|o| {
                     o.get("id").and_then(|v| v.as_str()) == Some("model")
                         && o.get("type").and_then(|v| v.as_str()) == Some("select")
@@ -497,25 +497,31 @@ pub fn query_models(
                             .iter()
                             .filter_map(|o| {
                                 o.get("name").and_then(|v| v.as_str()).map(|n| {
-                                    let id = format!("acp/{agent_type}/{n}");
+                                    let id = format!("acp/{agent_type_str}/{n}");
                                     let ctx = infer_context_window(n);
                                     (id, ctx)
                                 })
                             })
                             .collect();
                         if !ids.is_empty() {
+                            tracing::info!(
+                                "[{agent_type_str}] got {} models from ACP",
+                                ids.len()
+                            );
                             return Ok(ids);
                         }
                     }
                 }
 
-                Ok(vec![(format!("acp/{agent_type}"), 128_000u64)])
+                // ACP 没返回模型列表，用 static_models fallback
+                tracing::debug!("[{agent_type_str}] ACP returned no model list, using static fallback");
+                Ok(fallback_clone)
             };
             tokio::time::timeout(timeout, inner)
                 .await
                 .unwrap_or_else(|_| {
-                    tracing::warn!("[{agent_type}] query_models timed out after {timeout_secs}s");
-                    Ok(vec![(format!("acp/{agent_type}"), 128_000u64)])
+                    tracing::warn!("[{agent_type_str}] query_models timed out after {timeout_secs}s");
+                    Ok(fallback_timeout)
                 })
         })
     })
@@ -524,10 +530,10 @@ pub fn query_models(
     match result {
         Ok(Ok(models)) => models,
         Ok(Err(e)) => {
-            tracing::warn!("query_models error: {e}");
-            fallback
+            tracing::warn!("query_models error for {agent_type}: {e}");
+            static_fallback
         }
-        Err(_) => fallback,
+        Err(_) => static_fallback,
     }
 }
 
