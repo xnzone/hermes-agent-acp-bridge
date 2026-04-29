@@ -403,7 +403,7 @@ pub fn query_models(
             .static_models
             .iter()
             .map(|m| {
-                let id = format!("{agent_type}/{}", normalize_model_name(&m.name));
+                let id = format!("{agent_type}/{}", m.name);
                 let ctx = m.context_window.unwrap_or_else(|| infer_context_window(&m.name));
                 (id, ctx)
             })
@@ -497,7 +497,7 @@ pub fn query_models(
                             .iter()
                             .filter_map(|o| {
                                 o.get("name").and_then(|v| v.as_str()).map(|n| {
-                                    let id = format!("{agent_type_str}/{}", normalize_model_name(n));
+                                    let id = format!("{agent_type_str}/{n}");
                                     let ctx = infer_context_window(n);
                                     (id, ctx)
                                 })
@@ -558,8 +558,8 @@ async fn switch_model(
             options.iter().find(|o| {
                 let opt_name = o.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let opt_value = o.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                normalize_model_name(opt_name) == model_name
-                    || opt_name == model_name
+                opt_name == model_name
+                    || normalize_model_name(opt_name) == normalize_model_name(model_name)
                     || opt_value == model_name
             })
         })
